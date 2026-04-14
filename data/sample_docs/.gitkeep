@@ -1,0 +1,13 @@
+# Drop your PDF, DOCX, or Markdown documents here.
+# Run `python scripts/generate_sample_docs.py` to populate with realistic test documents.
+# Organize files into subdirectories by department:
+#
+#   data/sample_docs/
+#     hr/           → HR policies, handbooks
+#     engineering/  → Tech docs, runbooks
+#     finance/      → Expense, budget policies
+#     legal/        → Compliance, data policies
+#     general/      → IT, security, general company docs
+#
+# The subdirectory name becomes the `department` metadata field,
+# which can be used as a filter in API queries.

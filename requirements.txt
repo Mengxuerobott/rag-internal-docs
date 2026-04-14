@@ -1,0 +1,37 @@
+# Core RAG framework
+llama-index==0.10.68
+llama-index-core==0.10.68
+llama-index-readers-file==0.1.33
+llama-index-vector-stores-qdrant==0.2.16
+llama-index-postprocessor-cohere-rerank==0.1.9
+llama-index-retrievers-bm25==0.1.5
+llama-parse==0.4.9
+
+# LLM + embeddings
+openai==1.55.0
+
+# Vector database
+qdrant-client==1.11.3
+
+# Backend API
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.9.2
+python-multipart==0.0.17
+
+# Frontend
+streamlit==1.40.1
+
+# Evaluation
+ragas==0.2.6
+datasets==3.1.0
+
+# Observability
+langsmith==0.1.147
+
+# Utilities
+python-dotenv==1.0.1
+loguru==0.7.2
+httpx==0.27.2
+tenacity==9.0.0
+rich==13.9.4
