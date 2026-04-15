@@ -22,6 +22,7 @@ from llama_index.core import SimpleDirectoryReader, Document
 from llama_parse import LlamaParse
 from loguru import logger
 
+from auth.rbac import get_allowed_roles_for_path
 from config import settings
 
 
@@ -120,6 +121,18 @@ def load_documents(docs_dir: Optional[str] = None) -> list[Document]:
         else:
             doc.metadata["department"] = "general"
 
+        # ── RBAC: stamp allowed_roles onto every chunk ────────────────────
+        # get_allowed_roles_for_path maps the department folder name to the
+        # list of roles that may retrieve this chunk at query time.
+        # This list is stored verbatim in Qdrant's payload so the retriever
+        # can apply a pre-filter before the ANN search — no post-filtering.
+        #
+        # Example:  department="hr"  →  allowed_roles=["hr","management","admin"]
+        # A user whose JWT role is "engineering" expands to ["employee","engineering"]
+        # which has no intersection with ["hr","management","admin"] → chunk hidden.
+        department = doc.metadata["department"]
+        doc.metadata["allowed_roles"] = get_allowed_roles_for_path(department)
+
         # Mark ingest timestamp (ISO 8601)
         from datetime import datetime, timezone
         doc.metadata["ingested_at"] = datetime.now(timezone.utc).isoformat()
@@ -163,6 +176,7 @@ if __name__ == "__main__":
     table = Table(title=f"Loaded Documents from '{docs_path}'")
     table.add_column("Source", style="cyan")
     table.add_column("Department", style="green")
+    table.add_column("Allowed Roles", style="magenta")
     table.add_column("Type", style="yellow")
     table.add_column("Characters", justify="right")
 
@@ -170,6 +184,7 @@ if __name__ == "__main__":
         table.add_row(
             d.metadata.get("source", "—"),
             d.metadata.get("department", "—"),
+            str(d.metadata.get("allowed_roles", "—")),
             d.metadata.get("file_type", "—"),
             str(len(d.text)),
         )

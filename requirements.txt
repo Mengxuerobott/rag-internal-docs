@@ -1,5 +1,4 @@
-# Core RAG framework
-llama-index==0.10.68
+
 llama-index-core==0.10.68
 llama-index-readers-file==0.1.33
 llama-index-vector-stores-qdrant==0.2.16

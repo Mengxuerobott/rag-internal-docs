@@ -1,7 +1,8 @@
 # Enterprise Document RAG System
 
 A production-grade Retrieval-Augmented Generation (RAG) system for querying
-company internal documents using natural language.
+company internal documents using natural language. Built with the 2026 AI
+engineering stack.
 
 ---
 
@@ -124,7 +125,7 @@ rag-internal-docs/
 ### 1. Clone and configure
 
 ```bash
-git clone https://github.com/Mengxuerobott/rag-internal-docs.git
+git clone https://github.com/YOUR_USERNAME/rag-internal-docs.git
 cd rag-internal-docs
 cp .env.example .env
 # Edit .env and fill in your API keys
