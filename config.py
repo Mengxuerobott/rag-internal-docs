@@ -45,6 +45,13 @@ class Settings:
         int(x) for x in os.getenv("CHUNK_SIZES", "2048,512,128").split(",")
     ]
 
+    # ── Auth / JWT ────────────────────────────────────────────────────────────
+    # IMPORTANT: set a strong random secret in production.
+    # Generate one with:  python -c "import secrets; print(secrets.token_hex(32))"
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "change-me-in-production-use-secrets-token-hex-32")
+    JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
+    JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))  # 8 hours
+
     # ── API ───────────────────────────────────────────────────────────────────
     API_HOST: str = os.getenv("API_HOST", "0.0.0.0")
     API_PORT: int = int(os.getenv("API_PORT", "8000"))
