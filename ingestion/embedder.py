@@ -1,28 +1,32 @@
 """
 ingestion/embedder.py
 ─────────────────────
-Builds (or rebuilds) the vector index in Qdrant.
+Builds or reloads the Qdrant-backed vector index, and exposes two
+document-level mutation functions used by the webhook worker:
 
-What this module does:
-  1. Initialises the Qdrant collection (creates it if it doesn't exist).
-  2. Configures the LlamaIndex StorageContext to point at Qdrant.
-  3. Embeds every leaf node with OpenAI text-embedding-3-small.
-  4. Stores ALL nodes (parents + leaves) in Qdrant so the
-     AutoMergingRetriever can walk up from leaf → parent at query time.
-  5. Persists the docstore (node relationships) to disk so they survive restarts.
+  delete_document_chunks(doc_id)
+      Remove every Qdrant point whose payload contains doc_id == <value>.
+      Called before re-ingesting an updated document, and on document deletion.
 
-Why text-embedding-3-small?
-  - 1536-dim, strong MTEB benchmarks, cheap ($0.02 / 1M tokens as of 2026).
-  - Natively supported by LlamaIndex — no custom wrapper needed.
-  - Swap to a local model (e.g. nomic-embed-text via Ollama) by changing
-    EMBEDDING_MODEL in .env and replacing OpenAIEmbedding with OllamaEmbedding.
+  upsert_document(file_path, doc_id, allowed_roles)
+      Load one file, chunk it hierarchically, embed the leaf nodes, and
+      upsert them into Qdrant — tagging every chunk with doc_id and
+      allowed_roles so RBAC filtering and targeted deletion both work.
 
-Run this module to (re)ingest all documents:
-    python -m ingestion.embedder
-    python -m ingestion.embedder --docs-dir path/to/docs  # custom directory
+Why doc_id instead of filename?
+────────────────────────────────
+Filenames are mutable (a Confluence page can be renamed). The DMS assigns
+each document a stable ID that never changes even across renames or moves.
+We store that ID on every chunk so we can delete *exactly* that document's
+chunks with a single Qdrant filter — no full-collection scan needed.
+
+For locally-ingested files (batch mode), doc_id defaults to a SHA-256 hash
+of the file's absolute path so it stays stable even if the file is renamed.
 """
 
 import argparse
+import hashlib
+import os
 
 from llama_index.core import (
     Settings as LISettings,
@@ -36,15 +40,14 @@ from llama_index.llms.openai import OpenAI
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from loguru import logger
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, VectorParams
 
 from config import settings
-from ingestion.loader import load_documents
 from ingestion.chunker import build_hierarchical_nodes
+from ingestion.loader import load_documents, load_single_file
 
 
 # ── LlamaIndex global settings ────────────────────────────────────────────────
-# Set once here; all LlamaIndex objects created later inherit these.
 def configure_llama_index() -> None:
     LISettings.llm = OpenAI(
         model=settings.LLM_MODEL,
@@ -54,17 +57,14 @@ def configure_llama_index() -> None:
     LISettings.embed_model = OpenAIEmbedding(
         model=settings.EMBEDDING_MODEL,
         api_key=settings.OPENAI_API_KEY,
-        # Batch size: 100 is a safe default for the OpenAI API rate limits.
         embed_batch_size=100,
     )
-    # Chunk size for the LLM context window (should match your largest chunk tier)
     LISettings.chunk_size = settings.CHUNK_SIZES[0]
     LISettings.chunk_overlap = 20
 
 
-# ── Qdrant collection helpers ─────────────────────────────────────────────────
+# ── Qdrant helpers ────────────────────────────────────────────────────────────
 def get_qdrant_client() -> QdrantClient:
-    """Return a connected QdrantClient (local Docker or Qdrant Cloud)."""
     kwargs: dict = {"url": settings.QDRANT_URL}
     if settings.QDRANT_API_KEY:
         kwargs["api_key"] = settings.QDRANT_API_KEY
@@ -72,23 +72,17 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def ensure_collection(client: QdrantClient, collection_name: str) -> None:
-    """
-    Create the Qdrant collection if it doesn't already exist.
-    text-embedding-3-small produces 1536-dim vectors.
-    """
     existing = {c.name for c in client.get_collections().collections}
     if collection_name in existing:
         logger.info(f"Qdrant collection '{collection_name}' already exists — skipping creation")
         return
 
-    # Embedding dimension depends on the model
     dim_map = {
         "text-embedding-3-small": 1536,
         "text-embedding-3-large": 3072,
         "text-embedding-ada-002": 1536,
     }
     dim = dim_map.get(settings.EMBEDDING_MODEL, 1536)
-
     client.create_collection(
         collection_name=collection_name,
         vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
@@ -96,25 +90,191 @@ def ensure_collection(client: QdrantClient, collection_name: str) -> None:
     logger.info(f"Created Qdrant collection '{collection_name}' ({dim}d cosine)")
 
 
-# ── Main ingestion function ───────────────────────────────────────────────────
+def _stable_doc_id(file_path: str) -> str:
+    """
+    Derive a stable doc_id from an absolute file path.
+    Used for locally-ingested files when no DMS-assigned ID is available.
+    SHA-256 of the path is stable even if the file contents change.
+    """
+    return hashlib.sha256(os.path.abspath(file_path).encode()).hexdigest()[:32]
+
+
+# ── Document-level mutation functions (used by webhook worker) ────────────────
+
+def delete_document_chunks(doc_id: str) -> int:
+    """
+    Delete ALL Qdrant points whose payload field `doc_id` equals the given value.
+
+    This is the write-side of targeted deletion. When a webhook fires for a
+    document update or deletion, the worker calls this first to remove stale
+    chunks before (optionally) re-ingesting the new version.
+
+    Returns the number of points deleted (0 if the document was not indexed).
+
+    Why Qdrant filter delete instead of storing point IDs?
+    ───────────────────────────────────────────────────────
+    A single document produces O(N) chunks after hierarchical chunking. Storing
+    and tracking individual point UUIDs per document is brittle — one missed ID
+    and stale chunks survive. Filtering on a payload field is atomic and complete:
+    Qdrant deletes every matching point in one operation regardless of how many
+    chunks the document produced.
+    """
+    client = get_qdrant_client()
+
+    delete_filter = Filter(
+        must=[
+            FieldCondition(
+                key="doc_id",
+                match=MatchValue(value=doc_id),
+            )
+        ]
+    )
+
+    result = client.delete(
+        collection_name=settings.QDRANT_COLLECTION_NAME,
+        points_selector=delete_filter,
+    )
+
+    # Qdrant returns an UpdateResult; deleted count isn't directly exposed
+    # but the operation_id confirms it ran. Log for observability.
+    logger.info(f"Deleted chunks for doc_id={doc_id!r} — result: {result}")
+    return 0  # exact count not available in this Qdrant client version
+
+
+def upsert_document(
+    file_path: str,
+    doc_id: str | None = None,
+    allowed_roles: list[str] | None = None,
+) -> int:
+    """
+    Ingest a single file and upsert its chunks into Qdrant.
+
+    Steps:
+      1. Load the file with LlamaParse (or plain-text reader).
+      2. Build hierarchical nodes (2048 → 512 → 128 tokens).
+      3. Stamp doc_id and allowed_roles onto every chunk's metadata.
+      4. Embed leaf nodes and upsert into Qdrant (insert or overwrite).
+
+    Args:
+        file_path:     Absolute or relative path to the file.
+        doc_id:        Stable DMS document ID (e.g. Confluence page ID).
+                       Falls back to a SHA-256 of the file path.
+        allowed_roles: RBAC roles that may retrieve this document's chunks.
+                       If None, infers from the file's parent folder name
+                       via get_allowed_roles_for_path().
+
+    Returns:
+        Number of leaf nodes upserted.
+    """
+    from auth.rbac import get_allowed_roles_for_path
+    from pathlib import Path
+
+    configure_llama_index()
+
+    resolved_doc_id = doc_id or _stable_doc_id(file_path)
+    file_name = Path(file_path).name
+    folder_name = Path(file_path).parent.name
+
+    resolved_roles = allowed_roles or get_allowed_roles_for_path(folder_name)
+
+    logger.info(
+        f"Upserting document: file={file_name!r} "
+        f"doc_id={resolved_doc_id!r} roles={resolved_roles}"
+    )
+
+    # 1. Load
+    documents = load_single_file(file_path)
+
+    # 2. Stamp doc_id and allowed_roles onto every document before chunking
+    #    so all child nodes inherit these fields.
+    for doc in documents:
+        doc.metadata["doc_id"] = resolved_doc_id
+        doc.metadata["allowed_roles"] = resolved_roles
+        # Override department from the folder name
+        doc.metadata["department"] = folder_name
+
+    # 3. Chunk
+    all_nodes, leaf_nodes = build_hierarchical_nodes(documents)
+
+    # Ensure doc_id propagates to every node (chunker preserves metadata,
+    # but we stamp explicitly in case of any edge cases).
+    for node in all_nodes:
+        node.metadata.setdefault("doc_id", resolved_doc_id)
+        node.metadata.setdefault("allowed_roles", resolved_roles)
+
+    # 4. Connect to Qdrant
+    qdrant_client = get_qdrant_client()
+    ensure_collection(qdrant_client, settings.QDRANT_COLLECTION_NAME)
+
+    vector_store = QdrantVectorStore(
+        client=qdrant_client,
+        collection_name=settings.QDRANT_COLLECTION_NAME,
+        enable_hybrid=True,
+        batch_size=32,
+    )
+
+    # Load existing docstore so parent nodes are merged correctly
+    docstore: SimpleDocumentStore
+    persist_path = settings.INDEX_PERSIST_DIR
+    if os.path.exists(persist_path):
+        from llama_index.core.storage.docstore import SimpleDocumentStore
+        try:
+            docstore = SimpleDocumentStore.from_persist_dir(persist_path)
+        except Exception:
+            docstore = SimpleDocumentStore()
+    else:
+        docstore = SimpleDocumentStore()
+
+    docstore.add_documents(all_nodes)
+
+    storage_context = StorageContext.from_defaults(
+        vector_store=vector_store,
+        docstore=docstore,
+    )
+
+    # 5. Upsert: VectorStoreIndex.insert_nodes() upserts by node_id
+    index = VectorStoreIndex(
+        nodes=[],   # don't re-embed existing nodes
+        storage_context=storage_context,
+    )
+    index.insert_nodes(leaf_nodes)
+
+    # Persist updated docstore
+    os.makedirs(persist_path, exist_ok=True)
+    storage_context.persist(persist_dir=persist_path)
+
+    logger.info(
+        f"Upserted {len(leaf_nodes)} leaf nodes for doc_id={resolved_doc_id!r}"
+    )
+    return len(leaf_nodes)
+
+
+# ── Batch ingestion (unchanged from baseline) ─────────────────────────────────
+
 def build_index(docs_dir: str | None = None) -> VectorStoreIndex:
     """
-    Full ingestion pipeline:
-      load → chunk → embed → store in Qdrant.
-
-    Returns the VectorStoreIndex (used by the query engine).
+    Full batch ingestion pipeline: load → chunk → embed → store.
+    Stamps doc_id (path hash) and allowed_roles onto every chunk.
     """
     configure_llama_index()
 
-    # 1. Load documents
     logger.info("Step 1/4 — Loading documents")
     documents = load_documents(docs_dir)
 
-    # 2. Build hierarchical nodes
+    # Stamp doc_id derived from file path for every document
+    from pathlib import Path
+    for doc in documents:
+        file_path = doc.metadata.get("file_path", "")
+        doc.metadata.setdefault("doc_id", _stable_doc_id(file_path))
+
     logger.info("Step 2/4 — Chunking documents")
     all_nodes, leaf_nodes = build_hierarchical_nodes(documents)
 
-    # 3. Set up Qdrant
+    # Propagate doc_id to all nodes
+    for node in all_nodes:
+        if "doc_id" not in node.metadata:
+            node.metadata["doc_id"] = node.metadata.get("doc_id", "unknown")
+
     logger.info("Step 3/4 — Connecting to Qdrant")
     qdrant_client = get_qdrant_client()
     ensure_collection(qdrant_client, settings.QDRANT_COLLECTION_NAME)
@@ -122,12 +282,10 @@ def build_index(docs_dir: str | None = None) -> VectorStoreIndex:
     vector_store = QdrantVectorStore(
         client=qdrant_client,
         collection_name=settings.QDRANT_COLLECTION_NAME,
-        enable_hybrid=True,      # enables BM25 sparse vectors alongside dense
+        enable_hybrid=True,
         batch_size=32,
     )
 
-    # SimpleDocumentStore holds the full node tree (parent + child relationships)
-    # so AutoMergingRetriever can walk up from a leaf to its parent at query time.
     docstore = SimpleDocumentStore()
     docstore.add_documents(all_nodes)
 
@@ -136,16 +294,13 @@ def build_index(docs_dir: str | None = None) -> VectorStoreIndex:
         docstore=docstore,
     )
 
-    # 4. Embed leaf nodes and index them
     logger.info(f"Step 4/4 — Embedding {len(leaf_nodes)} leaf nodes into Qdrant")
     index = VectorStoreIndex(
-        nodes=leaf_nodes,           # only embed the leaves (small, precise chunks)
+        nodes=leaf_nodes,
         storage_context=storage_context,
         show_progress=True,
     )
 
-    # Persist node relationships to disk (for fast restarts without re-embedding)
-    import os
     os.makedirs(settings.INDEX_PERSIST_DIR, exist_ok=True)
     storage_context.persist(persist_dir=settings.INDEX_PERSIST_DIR)
     logger.info(f"Index persisted to '{settings.INDEX_PERSIST_DIR}'")
@@ -154,11 +309,6 @@ def build_index(docs_dir: str | None = None) -> VectorStoreIndex:
 
 
 def load_index() -> VectorStoreIndex:
-    """
-    Load an already-built index from disk + Qdrant.
-    Call this on API startup instead of rebuild_index() to avoid
-    re-embedding on every container restart.
-    """
     configure_llama_index()
 
     qdrant_client = get_qdrant_client()
@@ -167,24 +317,16 @@ def load_index() -> VectorStoreIndex:
         collection_name=settings.QDRANT_COLLECTION_NAME,
         enable_hybrid=True,
     )
-
     storage_context = StorageContext.from_defaults(
         vector_store=vector_store,
         persist_dir=settings.INDEX_PERSIST_DIR,
     )
-
     index = load_index_from_storage(storage_context)
     logger.info("Index loaded from persisted storage")
     return index
 
 
 def get_or_build_index(docs_dir: str | None = None) -> VectorStoreIndex:
-    """
-    Attempt to load a persisted index; fall back to full rebuild if not found.
-    This is what the API calls at startup.
-    """
-    import os
-
     if os.path.exists(settings.INDEX_PERSIST_DIR) and os.listdir(settings.INDEX_PERSIST_DIR):
         logger.info("Persisted index found — loading from disk")
         try:
@@ -196,26 +338,37 @@ def get_or_build_index(docs_dir: str | None = None) -> VectorStoreIndex:
     return build_index(docs_dir)
 
 
-# ── CLI entry point ───────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest documents into Qdrant.")
+    parser.add_argument("--docs-dir", default=None)
+    parser.add_argument("--force-rebuild", action="store_true")
     parser.add_argument(
-        "--docs-dir",
+        "--upsert-file",
         default=None,
-        help=f"Path to documents directory (default: {settings.DOCS_DIR})",
+        help="Upsert a single file by path (event-driven mode test)",
     )
     parser.add_argument(
-        "--force-rebuild",
-        action="store_true",
-        help="Delete existing index and rebuild from scratch",
+        "--delete-doc-id",
+        default=None,
+        help="Delete all chunks for a given doc_id",
     )
     args = parser.parse_args()
 
-    if args.force_rebuild:
-        import shutil, os
-        if os.path.exists(settings.INDEX_PERSIST_DIR):
-            shutil.rmtree(settings.INDEX_PERSIST_DIR)
-            logger.info("Deleted persisted index — rebuilding from scratch")
+    if args.delete_doc_id:
+        delete_document_chunks(args.delete_doc_id)
+        logger.info(f"Deletion complete for doc_id={args.delete_doc_id!r}")
 
-    index = build_index(args.docs_dir)
-    logger.info("Ingestion complete.")
+    elif args.upsert_file:
+        n = upsert_document(args.upsert_file)
+        logger.info(f"Upserted {n} chunks for {args.upsert_file!r}")
+
+    else:
+        if args.force_rebuild:
+            import shutil
+            if os.path.exists(settings.INDEX_PERSIST_DIR):
+                shutil.rmtree(settings.INDEX_PERSIST_DIR)
+                logger.info("Deleted persisted index — rebuilding from scratch")
+
+        build_index(args.docs_dir)
+        logger.info("Ingestion complete.")

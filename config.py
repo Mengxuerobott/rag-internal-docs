@@ -52,6 +52,25 @@ class Settings:
     JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
     JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))  # 8 hours
 
+    # ── Event-driven ingestion (Redis + ARQ) ──────────────────────────────────
+    # Redis is the job queue broker used by ARQ workers.
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+    # Maximum number of concurrent ingestion jobs a single worker processes.
+    WORKER_CONCURRENCY: int = int(os.getenv("WORKER_CONCURRENCY", "4"))
+
+    # Job retry settings
+    WORKER_MAX_RETRIES: int = int(os.getenv("WORKER_MAX_RETRIES", "3"))
+    WORKER_RETRY_DELAY_S: int = int(os.getenv("WORKER_RETRY_DELAY_S", "30"))
+
+    # ── Webhook HMAC secrets ──────────────────────────────────────────────────
+    # Each DMS provider signs its webhook payloads with one of these secrets.
+    # Set them to the values configured in each provider's webhook settings UI.
+    # Leave blank to SKIP signature verification (only for local dev/testing).
+    WEBHOOK_SECRET_CONFLUENCE: str = os.getenv("WEBHOOK_SECRET_CONFLUENCE", "")
+    WEBHOOK_SECRET_SHAREPOINT: str = os.getenv("WEBHOOK_SECRET_SHAREPOINT", "")
+    WEBHOOK_SECRET_GDRIVE: str = os.getenv("WEBHOOK_SECRET_GDRIVE", "")
+
     # ── API ───────────────────────────────────────────────────────────────────
     API_HOST: str = os.getenv("API_HOST", "0.0.0.0")
     API_PORT: int = int(os.getenv("API_PORT", "8000"))

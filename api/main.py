@@ -57,6 +57,7 @@ from retrieval.query_engine import (
     get_index,
     set_index,
 )
+from webhooks.router import router as webhook_router
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
@@ -93,6 +94,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount the webhook router (no auth — providers authenticate via HMAC signature)
+app.include_router(webhook_router)
 
 
 # ── Request / Response models ──────────────────────────────────────────────────

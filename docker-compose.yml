@@ -7,8 +7,8 @@ services:
     container_name: qdrant
     restart: unless-stopped
     ports:
-      - "6333:6333"   # REST API
-      - "6334:6334"   # gRPC
+      - "6333:6333"
+      - "6334:6334"
     volumes:
       - ./qdrant_storage:/qdrant/storage
     environment:
@@ -19,7 +19,23 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── FastAPI backend ───────────────────────────────────────────
+  # ── Redis (job queue for ARQ workers) ─────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes   # persist jobs across restarts
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── FastAPI backend (API + webhook receiver) ──────────────────
   api:
     build:
       context: .
@@ -29,11 +45,41 @@ services:
     ports:
       - "8000:8000"
     env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - QDRANT_URL=http://qdrant:6333
     volumes:
-      - ./data:/app/data          # mounted so you can drop docs in
+      - ./data:/app/data
       - ./qdrant_storage:/app/qdrant_storage
     depends_on:
       qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── ARQ ingestion worker ──────────────────────────────────────
+  # Runs the async job queue — picks up webhook-triggered ingestion
+  # jobs from Redis and processes them independently of the API server.
+  # Scale horizontally by adding more replicas:
+  #   docker compose up --scale worker=4
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: rag_worker
+    restart: unless-stopped
+    command: python -m workers.ingestion_worker
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - QDRANT_URL=http://qdrant:6333
+    volumes:
+      - ./data:/app/data
+      - ./qdrant_storage:/app/qdrant_storage
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   # ── Streamlit frontend ────────────────────────────────────────
@@ -53,3 +99,4 @@ services:
 
 volumes:
   qdrant_storage:
+  redis_data:
