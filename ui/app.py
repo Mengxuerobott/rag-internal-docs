@@ -46,15 +46,23 @@ st.set_page_config(
 
 # ── Session state init ────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
-    st.session_state.messages = []    # list of {"role": str, "content": str, "sources": list}
+    st.session_state.messages = []
 if "department_filter" not in st.session_state:
     st.session_state.department_filter = None
 if "indexed_docs" not in st.session_state:
     st.session_state.indexed_docs = []
+if "jwt_token" not in st.session_state:
+    st.session_state.jwt_token = None
+
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+def _auth_headers() -> dict:
+    token = st.session_state.get("jwt_token")
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 # ── Helper: call the API ──────────────────────────────────────────────────────
-def stream_query(question: str, filters: dict | None = None):
+def stream_query(question: str, department_filter: str | None = None):
     """
     Call POST /query/stream and yield (token, sources) tuples.
     Sources arrive in the last SSE event.
@@ -62,18 +70,22 @@ def stream_query(question: str, filters: dict | None = None):
     payload = {
         "question": question,
         "session_id": st.session_state.get("session_id", "streamlit"),
-        "filters": filters,
+        "department_filter": department_filter,
     }
     sources = []
-    answer_tokens = []
 
     with httpx.Client(timeout=60.0) as client:
-        with client.stream("POST", f"{API_BASE}/query/stream", json=payload) as response:
+        with client.stream(
+            "POST",
+            f"{API_BASE}/query/stream",
+            json=payload,
+            headers=_auth_headers(),
+        ) as response:
             response.raise_for_status()
             for line in response.iter_lines():
                 if not line.startswith("data: "):
                     continue
-                chunk = line[6:]   # strip "data: "
+                chunk = line[6:]
 
                 if chunk == "[DONE]":
                     break
@@ -84,32 +96,30 @@ def stream_query(question: str, filters: dict | None = None):
                         sources = json.loads(raw).get("sources", [])
                     except json.JSONDecodeError:
                         pass
-                    yield "", sources   # signal end of tokens
+                    yield "", sources
 
                 elif chunk.startswith("[ERROR]"):
                     st.error(f"API error: {chunk[7:]}")
                     break
 
                 else:
-                    answer_tokens.append(chunk)
                     yield chunk, []
 
 
 def fetch_docs_list() -> list[dict]:
-    """Fetch the list of indexed documents from the API."""
     try:
-        r = httpx.get(f"{API_BASE}/docs-list", timeout=10.0)
+        r = httpx.get(f"{API_BASE}/docs-list", headers=_auth_headers(), timeout=10.0)
         return r.json().get("documents", [])
     except Exception:
         return []
 
 
 def trigger_ingest(force: bool = False) -> str:
-    """Trigger re-ingestion via the API."""
     try:
         r = httpx.post(
             f"{API_BASE}/ingest",
             json={"force_rebuild": force},
+            headers=_auth_headers(),
             timeout=10.0,
         )
         return r.json().get("status", "unknown")
@@ -125,15 +135,36 @@ def check_api_health() -> bool:
         return False
 
 
+# ── Login (simple — shown if no token) ───────────────────────────────────────
+if not st.session_state.jwt_token:
+    st.title(f"{APP_ICON} {APP_TITLE}")
+    with st.form("login"):
+        username = st.text_input("Username", placeholder="alice, bob, admin…")
+        password = st.text_input("Password", type="password", value="secret")
+        if st.form_submit_button("Sign in"):
+            try:
+                r = httpx.post(
+                    f"{API_BASE}/auth/token",
+                    data={"username": username, "password": password},
+                    timeout=10.0,
+                )
+                if r.status_code == 200:
+                    st.session_state.jwt_token = r.json()["access_token"]
+                    st.session_state.username = username
+                    st.rerun()
+                else:
+                    st.error("Invalid credentials. Password for all demo accounts: secret")
+            except Exception as e:
+                st.error(f"Could not reach API: {e}")
+    st.stop()
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title(f"{APP_ICON} {APP_TITLE}")
 
-    # API health indicator
     api_ok = check_api_health()
-    st.markdown(
-        f"**API status:** {'🟢 Ready' if api_ok else '🔴 Offline'}"
-    )
+    st.markdown(f"**API status:** {'🟢 Ready' if api_ok else '🔴 Offline'}")
     st.divider()
 
     # Department filter
@@ -141,7 +172,7 @@ with st.sidebar:
     dept_options = ["All documents", "hr", "engineering", "finance", "legal", "general"]
     selected_dept = st.selectbox("Department", dept_options, index=0)
     st.session_state.department_filter = (
-        None if selected_dept == "All documents" else {"department": selected_dept}
+        None if selected_dept == "All documents" else selected_dept
     )
 
     st.divider()
@@ -156,9 +187,7 @@ with st.sidebar:
 
     if st.session_state.indexed_docs:
         for doc in st.session_state.indexed_docs[:20]:
-            st.markdown(
-                f"- `{doc['source']}` · *{doc['department']}*"
-            )
+            st.markdown(f"- `{doc['source']}` · *{doc['department']}*")
         if len(st.session_state.indexed_docs) > 20:
             st.caption(f"…and {len(st.session_state.indexed_docs) - 20} more")
     else:
@@ -166,7 +195,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Re-ingest controls
     st.subheader("Manage index")
     col1, col2 = st.columns(2)
     with col1:
@@ -174,13 +202,12 @@ with st.sidebar:
             status = trigger_ingest(force=False)
             st.success(f"Status: {status}")
     with col2:
-        if st.button("🔁 Rebuild", help="Wipes and rebuilds the entire index"):
+        if st.button("🔁 Rebuild"):
             status = trigger_ingest(force=True)
             st.warning(f"Status: {status}")
 
     st.divider()
 
-    # Clear conversation
     if st.button("🗑️ Clear conversation"):
         st.session_state.messages = []
         st.rerun()
@@ -192,12 +219,9 @@ st.header(f"{APP_ICON} Ask your internal docs")
 if st.session_state.department_filter:
     st.info(f"🔍 Searching only: **{selected_dept}** department docs")
 
-# Render conversation history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-
-        # Show sources (collapsed by default) for assistant messages
         if msg["role"] == "assistant" and msg.get("sources"):
             with st.expander(f"📚 Sources ({len(msg['sources'])} documents)", expanded=False):
                 for src in msg["sources"]:
@@ -208,7 +232,6 @@ for msg in st.session_state.messages:
                     st.caption(f"> {src['text_snippet']}…")
                     st.divider()
 
-# Suggested starter questions (only shown when chat is empty)
 if not st.session_state.messages:
     st.markdown("**Try asking:**")
     cols = st.columns(2)
@@ -217,19 +240,14 @@ if not st.session_state.messages:
             st.session_state._prefill = q
             st.rerun()
 
-# Handle pre-filled question from suggestion buttons
 prefill = st.session_state.pop("_prefill", None)
-
-# Chat input
 user_input = st.chat_input("Ask about company docs...") or prefill
 
 if user_input and api_ok:
-    # Add user message
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Stream assistant response
     with st.chat_message("assistant"):
         answer_placeholder = st.empty()
         accumulated = ""
@@ -239,7 +257,7 @@ if user_input and api_ok:
         with st.spinner("Searching docs…"):
             for token, sources in stream_query(
                 user_input,
-                filters=st.session_state.department_filter,
+                department_filter=st.session_state.department_filter,
             ):
                 if sources:
                     final_sources = sources
@@ -251,7 +269,6 @@ if user_input and api_ok:
         answer_placeholder.markdown(accumulated)
         st.caption(f"⏱ {latency:.1f}s")
 
-        # Show sources expander
         if final_sources:
             with st.expander(f"📚 Sources ({len(final_sources)} documents)", expanded=False):
                 for src in final_sources:
@@ -262,7 +279,6 @@ if user_input and api_ok:
                     st.caption(f"> {src['text_snippet']}…")
                     st.divider()
 
-    # Persist assistant message
     st.session_state.messages.append({
         "role": "assistant",
         "content": accumulated,

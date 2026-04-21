@@ -6,12 +6,16 @@ FastAPI backend for the RAG system.
 Endpoints:
   POST /auth/token        — Get a JWT (demo login)
   GET  /auth/me           — Inspect current user + role
+  GET  /auth/my-roles     — Show expanded RBAC roles
   POST /query             — Ask a question (auth required, RBAC enforced)
-  POST /query/stream      — Streaming version (auth required, RBAC enforced)
+  POST /query/stream      — Streaming version (SSE)
   POST /ingest            — Trigger re-ingestion (admin only)
   GET  /health            — Liveness check (public)
   GET  /docs-list         — List indexed docs visible to current user
   DELETE /collection      — Wipe Qdrant collection (admin only)
+  POST /webhooks/confluence — Confluence event webhook
+  POST /webhooks/sharepoint — SharePoint event webhook
+  POST /webhooks/gdrive     — Google Drive event webhook
 
 RBAC flow per request:
   1. FastAPI's OAuth2PasswordBearer reads Authorization: Bearer <jwt>.
@@ -24,10 +28,8 @@ Run locally:
     uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
 Demo credentials (password "secret" for all):
-    alice  / hr           bob    / engineering
-    carol  / finance      dave   / management
-    eve    / employee     frank  / legal
-    admin  / admin
+    alice=hr  bob=engineering  carol=finance  dave=management
+    eve=employee  frank=legal  admin=admin
 """
 
 import json
@@ -67,7 +69,7 @@ async def lifespan(app: FastAPI):
     start = time.perf_counter()
     try:
         index = get_or_build_index()
-        set_index(index)          # store singleton in retrieval module
+        set_index(index)
         elapsed = time.perf_counter() - start
         logger.info(f"Index ready in {elapsed:.1f}s")
     except Exception as e:
@@ -84,7 +86,7 @@ app = FastAPI(
         "Ask questions about your company's internal documents. "
         "All endpoints except /health and /auth/token require a Bearer JWT."
     ),
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -95,18 +97,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount the webhook router (no auth — providers authenticate via HMAC signature)
 app.include_router(webhook_router)
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
 class QueryRequest(BaseModel):
-    question: str = Field(..., min_length=3, max_length=2000,
-                          example="What is our parental leave policy?")
+    question: str = Field(
+        ..., min_length=3, max_length=2000,
+        example="What is our parental leave policy?",
+    )
     session_id: Optional[str] = Field(default=None)
     department_filter: Optional[str] = Field(
         default=None,
-        description="Optional extra filter: restrict to a specific department.",
+        description="Restrict search to a specific department.",
         example="hr",
     )
 
@@ -165,8 +168,8 @@ def _extract_sources(source_nodes) -> list[SourceDoc]:
 
 def _build_engine_for(user: CurrentUser, department_filter: Optional[str] = None):
     """
-    Build a per-request query engine with the user's RBAC filter.
-    Optionally layer an additional department filter on top.
+    Build a per-request RBAC-filtered query engine.
+    Optionally layers an additional department filter on top of the RBAC filter.
     """
     from llama_index.core.vector_stores.types import (
         MetadataFilter, MetadataFilters, FilterOperator, FilterCondition,
@@ -175,10 +178,6 @@ def _build_engine_for(user: CurrentUser, department_filter: Optional[str] = None
     index = get_index()
 
     if department_filter:
-        # Combine RBAC filter with department filter using AND.
-        # We do this by building the engine normally then patching the retriever,
-        # because build_query_engine_for_user already creates the RBAC filter.
-        # Simpler: pass a custom combined filter directly to as_retriever.
         accessible_roles = expand_roles(user.role)
         combined = MetadataFilters(
             filters=[
@@ -209,8 +208,9 @@ def _build_engine_for(user: CurrentUser, department_filter: Optional[str] = None
             alpha=settings.HYBRID_ALPHA,
             filters=combined,
         )
-        retriever = AutoMergingRetriever(base_ret, index.storage_context,
-                                         simple_ratio_thresh=0.5, verbose=False)
+        retriever = AutoMergingRetriever(
+            base_ret, index.storage_context, simple_ratio_thresh=0.5, verbose=False
+        )
         postprocessors = [SimilarityPostprocessor(similarity_cutoff=0.35)]
         if settings.COHERE_API_KEY:
             postprocessors.append(CohereRerank(
@@ -240,25 +240,17 @@ def _build_engine_for(user: CurrentUser, department_filter: Optional[str] = None
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
 @app.post("/auth/token", response_model=TokenResponse, tags=["auth"])
 async def token(form: OAuth2PasswordRequestForm = Depends()) -> TokenResponse:
-    """
-    Exchange username + password for a signed JWT.
-
-    Demo credentials (all use password "secret"):
-        alice=hr, bob=engineering, carol=finance, dave=management,
-        eve=employee, frank=legal, admin=admin
-    """
+    """Exchange username + password for a signed JWT."""
     return login(form)
 
 
 @app.get("/auth/me", response_model=CurrentUser, tags=["auth"])
 async def me(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
-    """Return the currently authenticated user's profile + role."""
     return user
 
 
 @app.get("/auth/my-roles", tags=["auth"])
 async def my_roles(user: CurrentUser = Depends(get_current_user)):
-    """Show the full set of roles this user's JWT grants access to."""
     return {
         "username": user.username,
         "role": user.role,
@@ -274,10 +266,7 @@ async def query(
 ) -> QueryResponse:
     """
     Answer a question from the indexed documents.
-
     RBAC enforced: only chunks accessible to the user's role are considered.
-    The Qdrant pre-filter is set to expand_roles(user.role) before the ANN
-    search runs — forbidden chunks are never scored or returned.
     """
     engine = _build_engine_for(user, req.department_filter)
     start = time.perf_counter()
@@ -287,8 +276,7 @@ async def query(
         latency = (time.perf_counter() - start) * 1000
         logger.info(
             f"Query answered in {latency:.0f}ms — "
-            f"user={user.username!r} role={user.role!r} "
-            f"session={req.session_id}"
+            f"user={user.username!r} role={user.role!r}"
         )
         return QueryResponse(
             answer=str(response),
@@ -357,21 +345,19 @@ async def ingest(
     """Trigger document re-ingestion. Admin role required."""
     _require_admin(user)
 
-    def _run_ingestion():
+    def _run():
         try:
             if req.force_rebuild:
                 import shutil
                 if os.path.exists(settings.INDEX_PERSIST_DIR):
                     shutil.rmtree(settings.INDEX_PERSIST_DIR)
-                logger.info("Deleted persisted index for forced rebuild")
-
             new_index = build_index(req.docs_dir)
             set_index(new_index)
             logger.info("Re-ingestion complete — index singleton updated")
         except Exception as e:
             logger.error(f"Re-ingestion failed: {e}")
 
-    background_tasks.add_task(_run_ingestion)
+    background_tasks.add_task(_run)
     return {"status": "ingestion started", "force_rebuild": req.force_rebuild}
 
 
@@ -381,11 +367,10 @@ async def delete_collection(user: CurrentUser = Depends(get_current_user)):
     _require_admin(user)
     from qdrant_client import QdrantClient
 
-    client = QdrantClient(url=settings.QDRANT_URL,
-                          api_key=settings.QDRANT_API_KEY or None)
+    client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY or None)
     try:
         client.delete_collection(settings.QDRANT_COLLECTION_NAME)
-        logger.warning(f"Collection '{settings.QDRANT_COLLECTION_NAME}' deleted by {user.username}")
+        logger.warning(f"Collection deleted by {user.username}")
         return {"status": "deleted", "collection": settings.QDRANT_COLLECTION_NAME}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -394,7 +379,6 @@ async def delete_collection(user: CurrentUser = Depends(get_current_user)):
 # ── Public endpoints ───────────────────────────────────────────────────────────
 @app.get("/health", response_model=HealthResponse, tags=["public"])
 async def health() -> HealthResponse:
-    """Liveness + readiness check. No auth required."""
     try:
         index = get_index()
         ready = index is not None
@@ -405,36 +389,23 @@ async def health() -> HealthResponse:
 
 @app.get("/docs-list", tags=["query"])
 async def docs_list(user: CurrentUser = Depends(get_current_user)):
-    """
-    List all documents in Qdrant that the current user is allowed to see.
-    Admins see everything; other roles see only their accessible chunks.
-    """
+    """List documents the current user is authorised to see."""
     from qdrant_client import QdrantClient
     from qdrant_client.models import Filter, FieldCondition, MatchAny
 
-    client = QdrantClient(url=settings.QDRANT_URL,
-                          api_key=settings.QDRANT_API_KEY or None)
-
+    client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY or None)
     accessible = expand_roles(user.role)
 
     try:
-        # Use Qdrant's native MatchAny to apply RBAC filter on the scroll too
-        qdrant_filter = Filter(
-            must=[
-                FieldCondition(
-                    key="allowed_roles",
-                    match=MatchAny(any=accessible),
-                )
-            ]
-        )
-
+        qdrant_filter = Filter(must=[
+            FieldCondition(key="allowed_roles", match=MatchAny(any=accessible))
+        ])
         results, _ = client.scroll(
             collection_name=settings.QDRANT_COLLECTION_NAME,
             scroll_filter=qdrant_filter,
             with_payload=True,
             limit=1000,
         )
-
         sources: dict[str, dict] = {}
         for point in results:
             meta = point.payload or {}
@@ -446,7 +417,6 @@ async def docs_list(user: CurrentUser = Depends(get_current_user)):
                     "allowed_roles": meta.get("allowed_roles", []),
                     "ingested_at": meta.get("ingested_at", "unknown"),
                 }
-
         return {
             "user_role": user.role,
             "accessible_roles": accessible,

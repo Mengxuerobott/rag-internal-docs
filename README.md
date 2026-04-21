@@ -35,6 +35,8 @@ engineering stack.
 | Embeddings | OpenAI `text-embedding-3-small` | Industry standard, 1536-dim, strong MTEB benchmarks |
 | Reranker | [Cohere Rerank v3](https://cohere.com/) | Cross-encoder, +18pp faithfulness gain in eval |
 | LLM | GPT-4o / Claude Sonnet | Configurable via `.env` |
+| Agentic router | GPT-4o-mini (classifier) | Intent classification routes queries to cheapest appropriate pipeline |
+| Multimodal | GPT-4o-mini (vision) | Table summarisation + image/chart description via VLM at ingestion time |
 | Evaluation | [RAGAS](https://github.com/explodinggradients/ragas) | Objective RAG metrics: faithfulness, relevancy, precision, recall |
 | Observability | [LangSmith](https://smith.langchain.com/) | Full trace of every chain execution |
 | Backend | FastAPI + uvicorn | Async, streaming SSE responses |
@@ -78,6 +80,24 @@ read the (query, chunk) pair together — a much harder relevance judgment.
 Cohere v3 dropped the average context window from 10 → 3 chunks while
 raising faithfulness by 18 percentage points.
 
+**Multimodal table summarisation instead of raw markdown embedding**
+Standard chunkers split markdown tables mid-row, and even intact raw tables produce weak vectors (`| 12 | 18 | 9 |` has no semantic meaning). Instead, each table is sent to GPT-4o-mini during ingestion to produce a natural-language summary. The summary is what gets embedded; the original markdown is stored in `node.metadata["original_table"]` and injected verbatim into the LLM's context window during answer synthesis. Cost: ~$0.001 per table, one-time at ingestion.
+
+**Image descriptions pre-computed at ingestion, not at query time**
+Running a VLM at query time (per-request) would add 2-5 seconds of latency for every question. Instead, GPT-4o-mini describes every chart and diagram once during ingestion — the description is embedded and retrieved like any other chunk. This trades a small up-front cost for zero extra query latency.
+
+**Multimodal nodes skip re-chunking**
+Table summaries and image descriptions are self-contained semantic units. Splitting a table summary mid-sentence destroys its meaning. `build_all_nodes()` in `chunker.py` treats multimodal nodes as leaf-level by default and merges them directly into the leaf set, bypassing the hierarchical splitter entirely.
+
+**Agentic routing instead of a fixed pipeline**
+Every query previously triggered hybrid search + AutoMerging + Cohere Reranker + GPT-4o (~1500ms). A greeting like "hi" wasted the entire stack. The intent classifier (one gpt-4o-mini call, ~100ms) routes to the cheapest appropriate handler: direct LLM reply for small-talk, a Qdrant scroll + summarisation for "summarise X" requests, and the full pipeline only for genuine knowledge retrieval questions. The classifier call is recovered in latency on 30-40% of production queries.
+
+**Structured JSON intent output extracts target_doc in the same call**
+The summarisation handler needs to know which document to fetch. Rather than a second LLM call to resolve "leave policy" → "leave_policy.md", the classifier prompt instructs the model to output `target_doc` in its JSON response. One call, two outputs.
+
+**Conversation memory is session-scoped, not query-scoped**
+SmallTalk and Summarization routes receive the last N turns as context. DeepRAG deliberately receives no history — injecting previous conversation into a vector query degrades retrieval precision (the query embedding shifts toward the history topics rather than the current question). Memory is stored per-session-id in a thread-safe LRU dict; in production this would be Redis.
+
 **Streaming SSE responses**
 The FastAPI backend streams tokens via Server-Sent Events so the UI renders
 each word as it arrives. Source citations are sent as a final structured SSE
@@ -90,10 +110,13 @@ event after the last token.
 ```
 rag-internal-docs/
 ├── ingestion/
-│   ├── loader.py          # LlamaParse + SimpleDirectoryReader
-│   ├── chunker.py         # Hierarchical + flat chunking strategies
-│   └── embedder.py        # Qdrant vector store build + reload
+│   ├── loader.py          # LlamaParse + multimodal pipeline orchestration
+│   ├── chunker.py         # Hierarchical chunking + multimodal node merge
+│   ├── embedder.py        # Qdrant build/reload + upsert_document
+│   └── multimodal.py      # Table summarisation + image VLM description
 ├── retrieval/
+│   ├── router.py          # Intent classifier + dispatch + conversation memory
+│   ├── handlers.py        # SmallTalkHandler, SummarizationHandler, DeepRagHandler
 │   ├── query_engine.py    # Hybrid search + AutoMerging + Cohere reranker
 │   └── reranker.py        # Reranker utilities + debug wrapper
 ├── api/
@@ -106,6 +129,10 @@ rag-internal-docs/
 │   └── generate_sample_docs.py   # Creates realistic fake internal docs
 ├── tests/
 │   ├── test_ingestion.py  # Unit tests for loader + chunker
+│   ├── test_router.py     # Intent classification, conversation memory, handler dispatch
+│   ├── test_multimodal.py # Table extraction, VLM summarisation, chunker merge
+│   ├── test_rbac.py       # Role expansion, permission stamping, JWT + API enforcement
+│   ├── test_webhooks.py   # HMAC verification, webhook payloads, worker job logic
 │   └── test_api.py        # Integration tests (mocked engine)
 ├── config.py              # Central settings from .env
 ├── docker-compose.yml
@@ -225,6 +252,76 @@ pytest tests/test_api.py -v
 
 # With coverage report
 pytest tests/ --cov=. --cov-report=html
+```
+
+---
+
+## Agentic query routing
+
+Every query is classified before touching the retrieval stack.
+
+```
+User query
+    │
+    ▼  classify_intent()  [gpt-4o-mini, ~100ms, structured JSON]
+    │
+    ├── small_talk    → Direct LLM reply + conversation history    (~150ms total)
+    │                   "hi", "what can you do?", "thanks", follow-up questions
+    │
+    ├── summarization → Qdrant scroll by doc_id/source + LLM      (~500ms total)
+    │                   "summarize the leave policy", "overview of onboarding guide"
+    │                   target_doc extracted by classifier in same call
+    │
+    └── deep_rag      → Hybrid BM25+vector → AutoMerge → Rerank → GPT-4o (~1500ms)
+                        Factual questions, policy lookups, procedural queries
+```
+
+Configure in `.env`:
+```bash
+ROUTER_MODEL=gpt-4o-mini          # classifier model (cheap + fast)
+CONVERSATION_MEMORY_TURNS=6       # turns kept per session
+CONVERSATION_MAX_SESSIONS=1000    # max sessions in memory
+```
+
+The `route_type` field in every response shows which path was taken:
+```json
+{"answer": "...", "route_type": "small_talk", "latency_ms": 145}
+{"answer": "...", "route_type": "summarization", "latency_ms": 490}
+{"answer": "...", "route_type": "deep_rag", "latency_ms": 1380}
+```
+
+
+---
+
+## Multimodal document processing
+
+Tables and images are processed during ingestion — not at query time.
+
+```
+Document ingestion pipeline:
+  load (LlamaParse)
+       │
+       ├── Tables detected (markdown regex)
+       │       └── GPT-4o-mini summary → TextNode(content_type="table")
+       │
+       ├── Images extracted (LlamaParse JSON mode)
+       │       └── GPT-4o-mini vision description → TextNode(content_type="image")
+       │
+       └── Cleaned text (tables stripped) → hierarchical chunking → text nodes
+                                   ↓
+                All nodes merged → Qdrant (one collection, one search)
+```
+
+**Why summarise instead of embedding raw markdown?**
+Raw table markdown (`| 12 | 18 | 9 |`) produces a weak embedding. A summary like
+"Q1 revenue by region: North America $1.2M, EMEA $0.8M, with North America growing
+15% QoQ" retrieves correctly when a user asks "which region grew fastest in Q1?"
+
+Configure in `.env`:
+```bash
+ENABLE_MULTIMODAL=true       # false skips processing (saves API cost during dev)
+VLM_MODEL=gpt-4o-mini        # gpt-4o for higher quality
+MULTIMODAL_MAX_IMAGE_MB=4.0  # skip images larger than this
 ```
 
 ---

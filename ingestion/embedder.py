@@ -43,7 +43,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, VectorParams
 
 from config import settings
-from ingestion.chunker import build_hierarchical_nodes
+from ingestion.chunker import build_all_nodes, build_hierarchical_nodes
 from ingestion.loader import load_documents, load_single_file
 
 
@@ -182,22 +182,27 @@ def upsert_document(
         f"doc_id={resolved_doc_id!r} roles={resolved_roles}"
     )
 
-    # 1. Load
-    documents = load_single_file(file_path)
+    # 1. Load + multimodal processing
+    # load_single_file returns (cleaned_docs, multimodal_nodes):
+    #   cleaned_docs     — text with raw tables stripped out
+    #   multimodal_nodes — table summaries + image descriptions
+    documents, multimodal_nodes = load_single_file(file_path)
 
     # 2. Stamp doc_id and allowed_roles onto every document before chunking
-    #    so all child nodes inherit these fields.
     for doc in documents:
         doc.metadata["doc_id"] = resolved_doc_id
         doc.metadata["allowed_roles"] = resolved_roles
-        # Override department from the folder name
         doc.metadata["department"] = folder_name
 
-    # 3. Chunk
-    all_nodes, leaf_nodes = build_hierarchical_nodes(documents)
+    # 3. Stamp doc_id onto multimodal nodes so targeted deletion works
+    for node in multimodal_nodes:
+        node.metadata["doc_id"] = resolved_doc_id
+        node.metadata.setdefault("allowed_roles", resolved_roles)
 
-    # Ensure doc_id propagates to every node (chunker preserves metadata,
-    # but we stamp explicitly in case of any edge cases).
+    # 4. Chunk (merges text hierarchy with multimodal nodes)
+    all_nodes, leaf_nodes = build_all_nodes(documents, multimodal_nodes)
+
+    # Ensure doc_id propagates to every node
     for node in all_nodes:
         node.metadata.setdefault("doc_id", resolved_doc_id)
         node.metadata.setdefault("allowed_roles", resolved_roles)
@@ -259,7 +264,10 @@ def build_index(docs_dir: str | None = None) -> VectorStoreIndex:
     configure_llama_index()
 
     logger.info("Step 1/4 — Loading documents")
-    documents = load_documents(docs_dir)
+    # load_documents() now returns (cleaned_docs, multimodal_nodes)
+    # cleaned_docs have raw tables replaced with placeholders
+    # multimodal_nodes are table summaries + image descriptions, ready to embed
+    documents, multimodal_nodes = load_documents(docs_dir)
 
     # Stamp doc_id derived from file path for every document
     from pathlib import Path
@@ -267,8 +275,13 @@ def build_index(docs_dir: str | None = None) -> VectorStoreIndex:
         file_path = doc.metadata.get("file_path", "")
         doc.metadata.setdefault("doc_id", _stable_doc_id(file_path))
 
-    logger.info("Step 2/4 — Chunking documents")
-    all_nodes, leaf_nodes = build_hierarchical_nodes(documents)
+    logger.info(
+        f"Step 2/4 — Chunking documents "
+        f"(+{len(multimodal_nodes)} multimodal node(s))"
+    )
+    # build_all_nodes merges text hierarchy nodes with pre-built multimodal nodes.
+    # Multimodal nodes skip re-chunking — they are already embedding-ready.
+    all_nodes, leaf_nodes = build_all_nodes(documents, multimodal_nodes)
 
     # Propagate doc_id to all nodes
     for node in all_nodes:
