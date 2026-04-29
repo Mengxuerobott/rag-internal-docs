@@ -3,13 +3,17 @@ ui/app.py
 ─────────
 Streamlit chat interface for the Internal Docs RAG assistant.
 
-Features:
+Features (updated for agentic routing):
+  - Login screen (JWT auth — required by all query endpoints)
+  - Route type badge on every answer: 💬 small_talk | 📄 summarization | 🔍 deep_rag
+  - [ROUTE] SSE event detected before first token, shown as a routing indicator
   - Streaming chat with token-by-token display
   - Source citation panel (expander below each answer)
-  - Department filter sidebar (filter searches to a specific team's docs)
-  - Document index browser (sidebar — lists all ingested files)
-  - Re-ingest button (triggers /ingest endpoint)
-  - Session history (persisted in Streamlit session state)
+  - Department filter sidebar
+  - Conversation history controls (view / clear via API endpoints)
+  - Document index browser
+  - Re-ingest button (admin only)
+  - Session history persisted in Streamlit session state
 
 Run locally:
     streamlit run ui/app.py
@@ -21,6 +25,7 @@ Requires API to be running:
 import json
 import os
 import time
+from typing import Optional
 
 import httpx
 import streamlit as st
@@ -29,12 +34,19 @@ import streamlit as st
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 APP_TITLE = "Internal Docs Assistant"
 APP_ICON = "📄"
+
 PLACEHOLDER_QUESTIONS = [
     "What is our parental leave policy?",
     "How do I submit an expense report?",
     "What are the onboarding steps for new engineers?",
     "What is our data retention policy?",
 ]
+
+ROUTE_BADGES = {
+    "small_talk":    ("💬", "Conversational", "#2196F3"),
+    "summarization": ("📄", "Full-doc summary", "#FF9800"),
+    "deep_rag":      ("🔍", "Deep retrieval", "#4CAF50"),
+}
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -45,65 +57,142 @@ st.set_page_config(
 )
 
 # ── Session state init ────────────────────────────────────────────────────────
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "department_filter" not in st.session_state:
-    st.session_state.department_filter = None
-if "indexed_docs" not in st.session_state:
-    st.session_state.indexed_docs = []
-if "jwt_token" not in st.session_state:
-    st.session_state.jwt_token = None
+for key, default in [
+    ("messages", []),
+    ("department_filter", None),
+    ("indexed_docs", []),
+    ("jwt_token", None),
+    ("username", None),
+    ("user_role", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
+def login(username: str, password: str) -> Optional[str]:
+    """Exchange credentials for a JWT. Returns the token or None on failure."""
+    try:
+        r = httpx.post(
+            f"{API_BASE}/auth/token",
+            data={"username": username, "password": password},
+            timeout=10.0,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            st.session_state.jwt_token = data["access_token"]
+            st.session_state.user_role = data.get("role", "employee")
+            return data["access_token"]
+        return None
+    except Exception:
+        return None
+
+
 def _auth_headers() -> dict:
     token = st.session_state.get("jwt_token")
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-# ── Helper: call the API ──────────────────────────────────────────────────────
-def stream_query(question: str, department_filter: str | None = None):
+def is_logged_in() -> bool:
+    return bool(st.session_state.get("jwt_token"))
+
+
+# ── Login screen ──────────────────────────────────────────────────────────────
+if not is_logged_in():
+    st.title(f"{APP_ICON} {APP_TITLE}")
+    st.caption("Sign in with your company account to access internal documents.")
+
+    with st.form("login_form"):
+        username = st.text_input("Username", placeholder="e.g. alice, bob, admin")
+        password = st.text_input("Password", type="password", placeholder="secret")
+        submitted = st.form_submit_button("Sign in", use_container_width=True)
+
+    if submitted:
+        with st.spinner("Signing in…"):
+            token = login(username, password)
+        if token:
+            st.session_state.username = username
+            st.success(f"Welcome, {username}! Role: **{st.session_state.user_role}**")
+            st.rerun()
+        else:
+            st.error("Invalid credentials. Demo accounts: alice/bob/carol/dave/eve/frank/admin (password: secret)")
+
+    with st.expander("Demo accounts"):
+        st.markdown("""
+| Username | Role | Can access |
+|----------|------|------------|
+| alice | hr | HR docs |
+| bob | engineering | Engineering docs |
+| carol | finance | Finance docs |
+| frank | legal | Legal docs |
+| dave | management | HR + Finance + Management |
+| eve | employee | General docs only |
+| admin | admin | Everything |
+
+All passwords: `secret`
+        """)
+    st.stop()
+
+
+# ── API helpers (require auth) ────────────────────────────────────────────────
+def stream_query(question: str, department_filter: Optional[str] = None):
     """
-    Call POST /query/stream and yield (token, sources) tuples.
-    Sources arrive in the last SSE event.
+    Call POST /query/stream and yield (event_type, data) tuples.
+
+    Event types yielded:
+        ("route",   route_type_string)     — first event, before any tokens
+        ("token",   token_string)          — answer tokens
+        ("sources", list_of_source_dicts)  — final event
+        ("error",   error_message)         — on failure
     """
     payload = {
         "question": question,
-        "session_id": st.session_state.get("session_id", "streamlit"),
+        "session_id": st.session_state.get("username", "streamlit"),
         "department_filter": department_filter,
     }
-    sources = []
 
-    with httpx.Client(timeout=60.0) as client:
-        with client.stream(
-            "POST",
-            f"{API_BASE}/query/stream",
-            json=payload,
-            headers=_auth_headers(),
-        ) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if not line.startswith("data: "):
-                    continue
-                chunk = line[6:]
+    try:
+        with httpx.Client(timeout=90.0) as client:
+            with client.stream(
+                "POST",
+                f"{API_BASE}/query/stream",
+                json=payload,
+                headers=_auth_headers(),
+            ) as response:
+                if response.status_code == 401:
+                    st.session_state.jwt_token = None  # force re-login
+                    yield ("error", "Session expired — please sign in again.")
+                    return
+                response.raise_for_status()
 
-                if chunk == "[DONE]":
-                    break
+                for line in response.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    chunk = line[6:]  # strip "data: "
 
-                if chunk.startswith("[SOURCES]"):
-                    raw = chunk[len("[SOURCES]"):]
-                    try:
-                        sources = json.loads(raw).get("sources", [])
-                    except json.JSONDecodeError:
-                        pass
-                    yield "", sources
+                    if chunk == "[DONE]":
+                        return
 
-                elif chunk.startswith("[ERROR]"):
-                    st.error(f"API error: {chunk[7:]}")
-                    break
+                    if chunk.startswith("[ROUTE]"):
+                        yield ("route", chunk[len("[ROUTE]"):])
 
-                else:
-                    yield chunk, []
+                    elif chunk.startswith("[SOURCES]"):
+                        try:
+                            sources = json.loads(chunk[len("[SOURCES]"):]).get("sources", [])
+                        except json.JSONDecodeError:
+                            sources = []
+                        yield ("sources", sources)
+
+                    elif chunk.startswith("[ERROR]"):
+                        yield ("error", chunk[7:])
+
+                    else:
+                        yield ("token", chunk)
+
+    except httpx.TimeoutException:
+        yield ("error", "Request timed out. The document may be very large.")
+    except Exception as e:
+        yield ("error", str(e))
 
 
 def fetch_docs_list() -> list[dict]:
@@ -122,9 +211,19 @@ def trigger_ingest(force: bool = False) -> str:
             headers=_auth_headers(),
             timeout=10.0,
         )
+        if r.status_code == 403:
+            return "❌ Admin role required"
         return r.json().get("status", "unknown")
     except Exception as e:
         return f"Error: {e}"
+
+
+def clear_conversation_history() -> None:
+    """Clear server-side conversation memory for this session."""
+    try:
+        httpx.delete(f"{API_BASE}/query/history", headers=_auth_headers(), timeout=5.0)
+    except Exception:
+        pass
 
 
 def check_api_health() -> bool:
@@ -135,36 +234,37 @@ def check_api_health() -> bool:
         return False
 
 
-# ── Login (simple — shown if no token) ───────────────────────────────────────
-if not st.session_state.jwt_token:
-    st.title(f"{APP_ICON} {APP_TITLE}")
-    with st.form("login"):
-        username = st.text_input("Username", placeholder="alice, bob, admin…")
-        password = st.text_input("Password", type="password", value="secret")
-        if st.form_submit_button("Sign in"):
-            try:
-                r = httpx.post(
-                    f"{API_BASE}/auth/token",
-                    data={"username": username, "password": password},
-                    timeout=10.0,
-                )
-                if r.status_code == 200:
-                    st.session_state.jwt_token = r.json()["access_token"]
-                    st.session_state.username = username
-                    st.rerun()
-                else:
-                    st.error("Invalid credentials. Password for all demo accounts: secret")
-            except Exception as e:
-                st.error(f"Could not reach API: {e}")
-    st.stop()
+def _route_badge(route_type: str) -> str:
+    icon, label, _ = ROUTE_BADGES.get(route_type, ("⚙️", route_type, "#888"))
+    return f"{icon} *{label}*"
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title(f"{APP_ICON} {APP_TITLE}")
 
+    # User info
+    st.markdown(
+        f"**Signed in as:** `{st.session_state.username}`  \n"
+        f"**Role:** `{st.session_state.user_role}`"
+    )
+    if st.button("Sign out"):
+        for key in ["jwt_token", "username", "user_role", "messages"]:
+            st.session_state[key] = None if key == "jwt_token" else []
+        st.rerun()
+
     api_ok = check_api_health()
-    st.markdown(f"**API status:** {'🟢 Ready' if api_ok else '🔴 Offline'}")
+    st.markdown(f"**API:** {'🟢 Ready' if api_ok else '🔴 Offline'}")
+    st.divider()
+
+    # Routing legend
+    st.subheader("Route types")
+    for rt, (icon, label, color) in ROUTE_BADGES.items():
+        st.markdown(f"{icon} **{label}** — `{rt}`")
+    st.caption(
+        "The router classifies each query and dispatches it to the cheapest "
+        "appropriate pipeline. Small talk bypasses vector search entirely."
+    )
     st.divider()
 
     # Department filter
@@ -177,7 +277,7 @@ with st.sidebar:
 
     st.divider()
 
-    # Indexed documents browser
+    # Indexed documents
     st.subheader("Indexed documents")
     if st.button("🔄 Refresh list"):
         st.session_state.indexed_docs = fetch_docs_list()
@@ -195,21 +295,21 @@ with st.sidebar:
 
     st.divider()
 
+    # Admin controls
     st.subheader("Manage index")
     col1, col2 = st.columns(2)
     with col1:
         if st.button("⚡ Re-ingest"):
-            status = trigger_ingest(force=False)
-            st.success(f"Status: {status}")
+            st.success(trigger_ingest(force=False))
     with col2:
         if st.button("🔁 Rebuild"):
-            status = trigger_ingest(force=True)
-            st.warning(f"Status: {status}")
+            st.warning(trigger_ingest(force=True))
 
     st.divider()
 
     if st.button("🗑️ Clear conversation"):
         st.session_state.messages = []
+        clear_conversation_history()
         st.rerun()
 
 
@@ -217,21 +317,28 @@ with st.sidebar:
 st.header(f"{APP_ICON} Ask your internal docs")
 
 if st.session_state.department_filter:
-    st.info(f"🔍 Searching only: **{selected_dept}** department docs")
+    st.info(f"🔍 Filtering to **{st.session_state.department_filter}** documents")
 
+# Render conversation history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
+        # Route badge (only on assistant messages that have one)
+        if msg["role"] == "assistant" and msg.get("route_type"):
+            st.caption(_route_badge(msg["route_type"]))
         st.markdown(msg["content"])
+
+        # Sources expander
         if msg["role"] == "assistant" and msg.get("sources"):
-            with st.expander(f"📚 Sources ({len(msg['sources'])} documents)", expanded=False):
+            with st.expander(f"📚 Sources ({len(msg['sources'])} docs)", expanded=False):
                 for src in msg["sources"]:
                     st.markdown(
                         f"**{src['source']}** · `{src['department']}` · "
                         f"score: `{src['score']}`"
                     )
-                    st.caption(f"> {src['text_snippet']}…")
+                    st.caption(f"> {src.get('text_snippet', '')}…")
                     st.divider()
 
+# Suggested starter questions
 if not st.session_state.messages:
     st.markdown("**Try asking:**")
     cols = st.columns(2)
@@ -249,40 +356,56 @@ if user_input and api_ok:
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
+        route_placeholder = st.empty()
         answer_placeholder = st.empty()
+
         accumulated = ""
         final_sources = []
+        final_route = "deep_rag"
         start = time.perf_counter()
 
-        with st.spinner("Searching docs…"):
-            for token, sources in stream_query(
+        with st.spinner("Thinking…"):
+            for event_type, data in stream_query(
                 user_input,
                 department_filter=st.session_state.department_filter,
             ):
-                if sources:
-                    final_sources = sources
-                else:
-                    accumulated += token
+                if event_type == "route":
+                    final_route = data
+                    # Show routing badge immediately before first token
+                    route_placeholder.caption(_route_badge(final_route))
+
+                elif event_type == "token":
+                    accumulated += data
                     answer_placeholder.markdown(accumulated + "▌")
+
+                elif event_type == "sources":
+                    final_sources = data
+
+                elif event_type == "error":
+                    st.error(f"Error: {data}")
+                    break
 
         latency = time.perf_counter() - start
         answer_placeholder.markdown(accumulated)
-        st.caption(f"⏱ {latency:.1f}s")
+        route_placeholder.caption(
+            f"{_route_badge(final_route)}  ·  ⏱ {latency:.1f}s"
+        )
 
         if final_sources:
-            with st.expander(f"📚 Sources ({len(final_sources)} documents)", expanded=False):
+            with st.expander(f"📚 Sources ({len(final_sources)} docs)", expanded=False):
                 for src in final_sources:
                     st.markdown(
                         f"**{src['source']}** · `{src['department']}` · "
                         f"score: `{src['score']}`"
                     )
-                    st.caption(f"> {src['text_snippet']}…")
+                    st.caption(f"> {src.get('text_snippet', '')}…")
                     st.divider()
 
     st.session_state.messages.append({
         "role": "assistant",
         "content": accumulated,
         "sources": final_sources,
+        "route_type": final_route,
     })
 
 elif user_input and not api_ok:

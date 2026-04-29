@@ -1,31 +1,33 @@
 """
 api/main.py
 ───────────
-FastAPI backend for the RAG system.
+FastAPI backend — now with agentic routing at the front of every query.
+
+Every POST /query and POST /query/stream request flows through route_query()
+which classifies intent then dispatches to the cheapest appropriate handler:
+
+  small_talk    → direct LLM reply, no retrieval  (~150ms)
+  summarization → Qdrant scroll + LLM summary     (~500ms)
+  deep_rag      → full 4-layer RAG pipeline       (~1500ms)
+
+The route_type field in every response tells the caller which path was taken,
+enabling the Streamlit UI to show a routing indicator.
 
 Endpoints:
-  POST /auth/token        — Get a JWT (demo login)
-  GET  /auth/me           — Inspect current user + role
-  GET  /auth/my-roles     — Show expanded RBAC roles
-  POST /query             — Ask a question (auth required, RBAC enforced)
-  POST /query/stream      — Streaming version (SSE)
-  POST /ingest            — Trigger re-ingestion (admin only)
-  GET  /health            — Liveness check (public)
-  GET  /docs-list         — List indexed docs visible to current user
-  DELETE /collection      — Wipe Qdrant collection (admin only)
+  POST /auth/token          — Get a JWT (demo login)
+  GET  /auth/me             — Inspect current user + role
+  GET  /auth/my-roles       — Show expanded RBAC roles
+  POST /query               — Agentic query (auth required, RBAC enforced)
+  POST /query/stream        — Streaming version (SSE)
+  GET  /query/history       — Retrieve conversation history for current session
+  DELETE /query/history     — Clear conversation history for current session
+  POST /ingest              — Trigger re-ingestion (admin only)
+  GET  /health              — Liveness check (public)
+  GET  /docs-list           — List indexed docs visible to current user
+  DELETE /collection        — Wipe Qdrant collection (admin only)
   POST /webhooks/confluence — Confluence event webhook
   POST /webhooks/sharepoint — SharePoint event webhook
   POST /webhooks/gdrive     — Google Drive event webhook
-
-RBAC flow per request:
-  1. FastAPI's OAuth2PasswordBearer reads Authorization: Bearer <jwt>.
-  2. get_current_user() verifies the JWT and returns CurrentUser(role=...).
-  3. build_query_engine_for_user(index, role) injects a Qdrant pre-filter
-     that restricts the ANN search to chunks the user's role can access.
-  4. The LLM only ever sees authorised chunks — no post-filtering leakage.
-
-Run locally:
-    uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
 Demo credentials (password "secret" for all):
     alice=hr  bob=engineering  carol=finance  dave=management
@@ -59,6 +61,7 @@ from retrieval.query_engine import (
     get_index,
     set_index,
 )
+from retrieval.router import route_query, route_query_stream, get_memory
 from webhooks.router import router as webhook_router
 
 
@@ -84,9 +87,10 @@ app = FastAPI(
     title="Internal Docs RAG API",
     description=(
         "Ask questions about your company's internal documents. "
-        "All endpoints except /health and /auth/token require a Bearer JWT."
+        "All endpoints except /health and /auth/token require a Bearer JWT. "
+        "Queries are automatically routed to the cheapest appropriate pipeline."
     ),
-    version="3.0.0",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
@@ -106,10 +110,14 @@ class QueryRequest(BaseModel):
         ..., min_length=3, max_length=2000,
         example="What is our parental leave policy?",
     )
-    session_id: Optional[str] = Field(default=None)
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Conversation session ID. Defaults to username. "
+                    "Pass a stable client-side ID to maintain history across page reloads.",
+    )
     department_filter: Optional[str] = Field(
         default=None,
-        description="Restrict search to a specific department.",
+        description="Restrict deep-RAG search to a specific department.",
         example="hr",
     )
 
@@ -127,6 +135,10 @@ class QueryResponse(BaseModel):
     sources: list[SourceDoc]
     latency_ms: float
     user_role: str
+    route_type: str = Field(
+        description="Which pipeline handled this query: "
+                    "small_talk | summarization | deep_rag"
+    )
 
 
 class IngestRequest(BaseModel):
@@ -148,32 +160,16 @@ def _require_admin(user: CurrentUser) -> None:
         )
 
 
-def _extract_sources(source_nodes) -> list[SourceDoc]:
-    sources, seen = [], set()
-    for node in source_nodes:
-        meta = node.node.metadata
-        src = meta.get("source", "unknown")
-        if src in seen:
-            continue
-        seen.add(src)
-        sources.append(SourceDoc(
-            source=src,
-            department=meta.get("department", "general"),
-            allowed_roles=meta.get("allowed_roles", []),
-            text_snippet=node.node.text[:300].replace("\n", " "),
-            score=round(node.score or 0.0, 4),
-        ))
-    return sorted(sources, key=lambda s: s.score, reverse=True)
-
-
-def _build_engine_for(user: CurrentUser, department_filter: Optional[str] = None):
+def _build_deep_rag_engine(user: CurrentUser, department_filter: Optional[str] = None):
     """
-    Build a per-request RBAC-filtered query engine.
-    Optionally layers an additional department filter on top of the RBAC filter.
+    Build the per-request RBAC-filtered deep-RAG engine.
+    Called only when the router selects the DEEP_RAG path.
+    For small_talk and summarization routes this is never called.
     """
     from llama_index.core.vector_stores.types import (
         MetadataFilter, MetadataFilters, FilterOperator, FilterCondition,
     )
+    from retrieval.query_engine import SYSTEM_PROMPT
 
     index = get_index()
 
@@ -200,7 +196,6 @@ def _build_engine_for(user: CurrentUser, department_filter: Optional[str] = None
         from llama_index.core.response_synthesizers import get_response_synthesizer
         from llama_index.core import PromptTemplate
         from llama_index.postprocessor.cohere_rerank import CohereRerank
-        from retrieval.query_engine import SYSTEM_PROMPT
 
         base_ret = index.as_retriever(
             similarity_top_k=settings.TOP_K_RETRIEVAL,
@@ -237,6 +232,19 @@ def _build_engine_for(user: CurrentUser, department_filter: Optional[str] = None
     return build_query_engine_for_user(index, user.role)
 
 
+def _sources_to_model(sources: list[dict]) -> list[SourceDoc]:
+    return [
+        SourceDoc(
+            source=s.get("source", "unknown"),
+            department=s.get("department", "general"),
+            allowed_roles=s.get("allowed_roles", []),
+            text_snippet=s.get("text_snippet", ""),
+            score=s.get("score", 0.0),
+        )
+        for s in sources
+    ]
+
+
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
 @app.post("/auth/token", response_model=TokenResponse, tags=["auth"])
 async def token(form: OAuth2PasswordRequestForm = Depends()) -> TokenResponse:
@@ -265,25 +273,47 @@ async def query(
     user: CurrentUser = Depends(get_current_user),
 ) -> QueryResponse:
     """
-    Answer a question from the indexed documents.
-    RBAC enforced: only chunks accessible to the user's role are considered.
+    Route the query through the intent classifier then dispatch to the
+    cheapest appropriate pipeline.
+
+    RBAC is enforced on ALL routes:
+      - small_talk: no documents accessed, no RBAC needed
+      - summarization: Qdrant scroll filtered by expand_roles(user.role)
+      - deep_rag: Qdrant ANN pre-filtered by expand_roles(user.role)
+
+    The route_type field in the response shows which path was taken.
     """
-    engine = _build_engine_for(user, req.department_filter)
-    start = time.perf_counter()
+    # Build the deep-RAG engine up-front — the router decides whether to use it.
+    # Cost: pure Python object instantiation, no I/O if router picks another route.
+    # For small_talk / summarization the engine object is created but never called.
+    try:
+        query_engine = _build_deep_rag_engine(user, req.department_filter)
+    except Exception as e:
+        logger.error(f"Failed to build query engine: {e}")
+        query_engine = None
 
     try:
-        response = engine.query(req.question)
-        latency = (time.perf_counter() - start) * 1000
+        result = route_query(
+            question=req.question,
+            user=user,
+            session_id=req.session_id,
+            query_engine=query_engine,
+        )
+
         logger.info(
-            f"Query answered in {latency:.0f}ms — "
-            f"user={user.username!r} role={user.role!r}"
+            f"Query complete: route={result.route_type!r} "
+            f"latency={result.latency_ms:.0f}ms "
+            f"user={user.username!r}"
         )
+
         return QueryResponse(
-            answer=str(response),
-            sources=_extract_sources(response.source_nodes),
-            latency_ms=round(latency, 1),
+            answer=result.answer,
+            sources=_sources_to_model(result.sources),
+            latency_ms=result.latency_ms,
             user_role=user.role,
+            route_type=result.route_type,
         )
+
     except Exception as e:
         logger.error(f"Query failed for user={user.username}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -295,44 +325,65 @@ async def query_stream(
     user: CurrentUser = Depends(get_current_user),
 ) -> StreamingResponse:
     """
-    Streaming version of /query — yields SSE tokens then a sources event.
-    RBAC is enforced identically to /query.
+    Streaming version — yields SSE events:
+      data: [ROUTE]<route_type>
+      data: <token>...
+      data: [SOURCES]{...}
+      data: [DONE]
 
-    SSE format:
-        data: <token>\\n\\n
-        ...
-        data: [SOURCES]{...}\\n\\n
-        data: [DONE]\\n\\n
+    The [ROUTE] event arrives before the first token so the UI can show
+    a routing indicator immediately.
     """
-    engine = _build_engine_for(user, req.department_filter)
+    try:
+        query_engine = _build_deep_rag_engine(user, req.department_filter)
+    except Exception:
+        query_engine = None
 
-    async def token_generator() -> AsyncGenerator[str, None]:
-        start = time.perf_counter()
+    async def generator() -> AsyncGenerator[str, None]:
         try:
-            streaming_response = engine.query(req.question)
-            for token in streaming_response.response_gen:
-                yield f"data: {token}\n\n"
-
-            sources = _extract_sources(streaming_response.source_nodes)
-            sources_payload = json.dumps({"sources": [s.model_dump() for s in sources]})
-            yield f"data: [SOURCES]{sources_payload}\n\n"
-
-            latency = (time.perf_counter() - start) * 1000
-            logger.info(
-                f"Stream answered in {latency:.0f}ms — "
-                f"user={user.username!r} role={user.role!r}"
-            )
+            async for chunk in route_query_stream(
+                question=req.question,
+                user=user,
+                session_id=req.session_id,
+                query_engine=query_engine,
+            ):
+                yield chunk
         except Exception as e:
             logger.error(f"Streaming query failed: {e}")
             yield f"data: [ERROR]{str(e)}\n\n"
-        finally:
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(
-        token_generator(),
+        generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/query/history", tags=["query"])
+async def conversation_history(
+    session_id: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Return the conversation history for the current session."""
+    effective_session = session_id or user.username
+    history = get_memory().get(effective_session)
+    return {
+        "session_id": effective_session,
+        "turns": len(history) // 2,
+        "messages": [{"role": t.role, "content": t.content} for t in history],
+    }
+
+
+@app.delete("/query/history", tags=["query"])
+async def clear_history(
+    session_id: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Clear the conversation history for the current session."""
+    effective_session = session_id or user.username
+    get_memory().clear(effective_session)
+    return {"status": "cleared", "session_id": effective_session}
 
 
 # ── Admin endpoints ────────────────────────────────────────────────────────────

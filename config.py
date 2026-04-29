@@ -67,15 +67,38 @@ class Settings:
     JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))  # 8 hours
 
     # ── Event-driven ingestion (Redis + ARQ) ──────────────────────────────────
+    # Redis is the job queue broker used by ARQ workers.
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+    # Maximum number of concurrent ingestion jobs a single worker processes.
     WORKER_CONCURRENCY: int = int(os.getenv("WORKER_CONCURRENCY", "4"))
+
+    # Job retry settings
     WORKER_MAX_RETRIES: int = int(os.getenv("WORKER_MAX_RETRIES", "3"))
     WORKER_RETRY_DELAY_S: int = int(os.getenv("WORKER_RETRY_DELAY_S", "30"))
 
     # ── Webhook HMAC secrets ──────────────────────────────────────────────────
+    # Each DMS provider signs its webhook payloads with one of these secrets.
+    # Set them to the values configured in each provider's webhook settings UI.
+    # Leave blank to SKIP signature verification (only for local dev/testing).
     WEBHOOK_SECRET_CONFLUENCE: str = os.getenv("WEBHOOK_SECRET_CONFLUENCE", "")
     WEBHOOK_SECRET_SHAREPOINT: str = os.getenv("WEBHOOK_SECRET_SHAREPOINT", "")
     WEBHOOK_SECRET_GDRIVE: str = os.getenv("WEBHOOK_SECRET_GDRIVE", "")
+
+    # ── Agentic router ───────────────────────────────────────────────────────
+    # Model used for the intent classification call (the router).
+    # This must be fast and cheap — gpt-4o-mini is ideal.
+    # The router call adds ~100-200ms but saves 1-3s on non-RAG queries.
+    ROUTER_MODEL: str = os.getenv("ROUTER_MODEL", "gpt-4o-mini")
+
+    # How many previous turns (user+assistant pairs) to include in the
+    # conversation context window sent to small-talk and summarisation routes.
+    # Deep-RAG route does NOT use conversation history (stateless retrieval).
+    CONVERSATION_MEMORY_TURNS: int = int(os.getenv("CONVERSATION_MEMORY_TURNS", "6"))
+
+    # Maximum number of concurrent conversation sessions kept in memory.
+    # Oldest sessions are evicted when this limit is reached.
+    CONVERSATION_MAX_SESSIONS: int = int(os.getenv("CONVERSATION_MAX_SESSIONS", "1000"))
 
     # ── API ───────────────────────────────────────────────────────────────────
     API_HOST: str = os.getenv("API_HOST", "0.0.0.0")

@@ -36,6 +36,7 @@ engineering stack.
 | Reranker | [Cohere Rerank v3](https://cohere.com/) | Cross-encoder, +18pp faithfulness gain in eval |
 | LLM | GPT-4o / Claude Sonnet | Configurable via `.env` |
 | Agentic router | GPT-4o-mini (classifier) | Intent classification routes queries to cheapest appropriate pipeline |
+| Agentic router | GPT-4o-mini (intent classifier) | Routes each query to the cheapest pipeline: small_talk / summarization / deep_rag |
 | Multimodal | GPT-4o-mini (vision) | Table summarisation + image/chart description via VLM at ingestion time |
 | Evaluation | [RAGAS](https://github.com/explodinggradients/ragas) | Objective RAG metrics: faithfulness, relevancy, precision, recall |
 | Observability | [LangSmith](https://smith.langchain.com/) | Full trace of every chain execution |
@@ -130,6 +131,7 @@ rag-internal-docs/
 ├── tests/
 │   ├── test_ingestion.py  # Unit tests for loader + chunker
 │   ├── test_router.py     # Intent classification, conversation memory, handler dispatch
+│   ├── test_router.py     # Intent classification, memory, handler dispatch, API integration
 │   ├── test_multimodal.py # Table extraction, VLM summarisation, chunker merge
 │   ├── test_rbac.py       # Role expansion, permission stamping, JWT + API enforcement
 │   ├── test_webhooks.py   # HMAC verification, webhook payloads, worker job logic
@@ -290,6 +292,47 @@ The `route_type` field in every response shows which path was taken:
 {"answer": "...", "route_type": "deep_rag", "latency_ms": 1380}
 ```
 
+## Agentic routing
+
+Every query is classified by a single `gpt-4o-mini` call before anything else runs.
+
+```
+User query
+    │
+    ▼
+classify_intent()  ← gpt-4o-mini, structured JSON, ~100ms
+    │
+    ├──► small_talk     → direct LLM reply, zero retrieval     (~150ms total)
+    │                     e.g. "hi", "what can you do?", "thanks"
+    │
+    ├──► summarization  → Qdrant scroll by doc_id + LLM        (~500ms total)
+    │                     e.g. "summarize the leave policy"
+    │                     Bypasses vector search entirely — fetches
+    │                     ALL chunks for the document in one scroll.
+    │
+    └──► deep_rag       → full 4-layer pipeline                (~1500ms total)
+                          Hybrid search → AutoMerging →
+                          Cohere Rerank → GPT-4o
+```
+
+**Why a classifier LLM call instead of keyword rules?**
+Keyword rules break on edge cases: "summarize how the expense policy works"
+should be `deep_rag` (asking *how*, not asking for a full-doc summary).
+A cheap LLM classifier handles these correctly. The structured JSON output also
+extracts the `target_doc` filename for summarisation in the same call — no
+second round-trip needed.
+
+**Conversation memory** is maintained per session (LRU store, last 6 turns).
+`small_talk` and `summarization` routes receive full history so follow-up
+questions resolve correctly. `deep_rag` is intentionally stateless — injecting
+prior turns into the vector query degrades retrieval precision.
+
+Configure in `.env`:
+```bash
+ROUTER_MODEL=gpt-4o-mini          # intent classifier model
+CONVERSATION_MEMORY_TURNS=6       # turns kept per session
+CONVERSATION_MAX_SESSIONS=1000    # max concurrent sessions
+```
 
 ---
 
@@ -344,7 +387,8 @@ Response:
   "sources": [
     {"source": "leave_policy.md", "department": "hr", "score": 0.91, "text_snippet": "..."}
   ],
-  "latency_ms": 1380.5
+  "latency_ms": 1380.5,
+  "route_type": "deep_rag"
 }
 ```
 
