@@ -4,26 +4,44 @@ retrieval/router.py
 The agentic router — sits at the very front of the pipeline and decides
 which handler processes each incoming query.
 
-Architecture
-────────────
-Every request flows through route_query():
+Architecture (updated for Feature 5 — semantic caching)
+────────────────────────────────────────────────────────
 
   User query
       │
       ▼
-  classify_intent()          ← one gpt-4o-mini call, structured JSON output
+  SemanticCache.get()        ← embed + cosine similarity vs Redis, ~100ms
       │
-      ├──► SMALL_TALK   ──► SmallTalkHandler     (no retrieval, ~50ms)
+      ├──► CACHE HIT   ──► return cached answer immediately           (~100ms)
       │
-      ├──► SUMMARIZATION ──► SummarizationHandler (Qdrant scroll + LLM, ~500ms)
-      │
-      └──► DEEP_RAG      ──► DeepRagHandler       (full pipeline, ~1500ms)
-                                    │
-                              (RBAC pre-filter)
-                              Hybrid search
-                              AutoMerging
-                              Cohere Rerank
-                              GPT-4o
+      └──► CACHE MISS
+               │
+               ▼
+           classify_intent()  ← gpt-4o-mini, structured JSON          (~150ms)
+               │
+               ├──► SMALL_TALK   ──► SmallTalkHandler                (~50ms)
+               │
+               ├──► SUMMARIZATION ──► SummarizationHandler           (~500ms)
+               │                         │
+               └──► DEEP_RAG      ──► DeepRagHandler                 (~1200ms)
+                                         │
+                                   (RBAC pre-filter)
+                                   Hybrid search
+                                   AutoMerging
+                                   Cohere Rerank
+                                   GPT-4o
+                                         │
+                                         ▼
+                                  SemanticCache.set()
+                                  (write result to Redis for future hits)
+
+Cache scoping
+──────────────
+Cache is partitioned by (user_role, dept_filter).  Two users with different
+roles never share cache entries — this is the RBAC guarantee of the cache.
+
+Small-talk responses are NEVER written to cache (they are conversational,
+session-specific, and cheap enough that caching them provides no value).
 
 Conversation memory
 ────────────────────
@@ -31,32 +49,16 @@ The router maintains an in-process LRU conversation store keyed by session_id.
 Each session holds the last CONVERSATION_MEMORY_TURNS (user, assistant) pairs.
 
   - SmallTalk and Summarization receive full history (they are conversational).
-  - DeepRAG receives NO history — retrieval is stateless by design, and injecting
-    previous turns into the vector query would degrade retrieval precision.
-
-The session_id comes from the JWT (username) as a fallback if the API client
-doesn't supply one explicitly, so each user gets a stable per-user history.
+  - DeepRAG receives NO history — retrieval is stateless by design.
 
 Why a single classifier LLM call instead of keyword heuristics?
 ────────────────────────────────────────────────────────────────
 Keyword rules break quickly:
-  "summarize how the expense policy works" → should be DEEP_RAG (asking how,
-  not asking for a full doc summary)
-  "hi, what is the expense policy?" → SMALL_TALK despite mentioning a policy name
+  "summarize how the expense policy works" → should be DEEP_RAG
+  "hi, what is the expense policy?" → SMALL_TALK despite mentioning a policy
 
 A cheap LLM classifier (gpt-4o-mini, ~50ms, ~$0.00002/call) handles these
-ambiguities correctly and can use conversation history to resolve pronouns.
-The structured JSON output with a `target_doc` field means the summarisation
-handler gets the resolved filename without a second LLM call.
-
-Interview talking point
-────────────────────────
-"The router adds ~100ms of latency but saves 1-2 seconds on 30-40% of queries.
-In user-facing chat applications, response time under 200ms feels instant;
-1500ms feels slow. For small-talk queries the full RAG pipeline was pure waste —
-the vector search would return irrelevant chunks and the LLM would ignore them
-anyway. The structured intent classification also extracts the target document
-name in the same call, so summarisation doesn't need a second round-trip."
+correctly and can use conversation history to resolve pronouns.
 """
 
 from __future__ import annotations
@@ -72,6 +74,7 @@ from loguru import logger
 from openai import OpenAI
 
 from auth.jwt_handler import CurrentUser
+from cache.semantic_cache import CacheEntry, SemanticCache, get_semantic_cache
 from config import settings
 from retrieval.handlers import (
     ConversationTurn,
@@ -168,7 +171,6 @@ def classify_intent(
     """
     client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
-    # Format history for the classifier
     history_text = "\n".join(
         f"  {t.role.upper()}: {t.content[:200]}"
         for t in history[-settings.CONVERSATION_MEMORY_TURNS:]
@@ -188,11 +190,11 @@ def classify_intent(
                 {"role": "user",   "content": user_message},
             ],
             max_tokens=150,
-            temperature=0.0,    # deterministic classification
+            temperature=0.0,
             response_format={"type": "json_object"},
         )
 
-        raw = response.choices[0].message.content.strip()
+        raw  = response.choices[0].message.content.strip()
         data = json.loads(raw)
 
         intent_str = data.get("intent", "deep_rag")
@@ -247,7 +249,6 @@ class ConversationMemory:
         self._lock = threading.Lock()
 
     def get(self, session_id: str) -> list[ConversationTurn]:
-        """Return the conversation history for a session (empty list if new)."""
         with self._lock:
             return list(self._store.get(session_id, []))
 
@@ -257,31 +258,22 @@ class ConversationMemory:
         user_message: str,
         assistant_message: str,
     ) -> None:
-        """
-        Append a (user, assistant) turn to the session.
-        Evicts the oldest session if the store is at capacity.
-        Trims old turns beyond max_turns per session.
-        """
         with self._lock:
             if session_id not in self._store:
-                # Evict oldest session if at capacity
                 if len(self._store) >= self._max_sessions:
                     self._store.popitem(last=False)
                 self._store[session_id] = []
             else:
-                # Move to end (LRU — most recently used last)
                 self._store.move_to_end(session_id)
 
             turns = self._store[session_id]
             turns.append(ConversationTurn(role="user",      content=user_message))
             turns.append(ConversationTurn(role="assistant", content=assistant_message))
 
-            # Keep only the last max_turns × 2 messages (each turn = user + assistant)
             if len(turns) > self._max_turns * 2:
                 self._store[session_id] = turns[-(self._max_turns * 2):]
 
     def clear(self, session_id: str) -> None:
-        """Clear all history for a session."""
         with self._lock:
             self._store.pop(session_id, None)
 
@@ -291,40 +283,74 @@ class ConversationMemory:
             return len(self._store)
 
 
-# Module-level singleton — shared across all requests in this process
 _memory = ConversationMemory()
 
 
 def get_memory() -> ConversationMemory:
-    """Return the module-level conversation memory singleton."""
     return _memory
+
+
+# ── Cache helper ──────────────────────────────────────────────────────────────
+
+def _result_from_cache(entry: CacheEntry, question: str) -> RouteResult:
+    """Wrap a CacheEntry in a RouteResult for the router to return."""
+    return RouteResult(
+        answer=entry.answer,
+        route_type="cache_hit",
+        sources=entry.sources,
+        latency_ms=entry.lookup_ms,
+    )
 
 
 # ── Main dispatch function ────────────────────────────────────────────────────
 
 def route_query(
-    question: str,
-    user: CurrentUser,
-    session_id: Optional[str] = None,
-    query_engine=None,   # RetrieverQueryEngine from api/main.py
+    question:        str,
+    user:            CurrentUser,
+    session_id:      Optional[str] = None,
+    query_engine=None,
+    department_filter: Optional[str] = None,
 ) -> RouteResult:
     """
-    Classify the query intent and dispatch to the correct handler.
+    Semantic-cache check → intent classify → dispatch to handler.
 
-    This is the single entry point called by api/main.py for every query.
-    It replaces the old `_build_engine_for(user, ...)` + `engine.query(question)`.
+    Pipeline (in order):
+      1. SemanticCache.get() — return cached answer if cosine sim ≥ threshold
+      2. classify_intent()  — gpt-4o-mini call
+      3. Handler dispatch   — SmallTalk / Summarization / DeepRAG
+      4. SemanticCache.set() — write non-small-talk results to cache
 
     Args:
-        question:     The user's raw query string.
-        user:         Authenticated CurrentUser from JWT.
-        session_id:   Conversation session key (defaults to username).
-        query_engine: Pre-built DeepRAG engine (built in api/main.py with RBAC
-                      filter already applied). Required for DEEP_RAG route.
+        question:          Raw user query string.
+        user:              Authenticated CurrentUser from JWT.
+        session_id:        Conversation session key (defaults to username).
+        query_engine:      Pre-built DeepRAG engine from api/main.py.
+        department_filter: Department restriction (used as cache namespace key).
 
     Returns:
         RouteResult with answer, sources, route_type, and latency_ms.
     """
     effective_session = session_id or user.username
+
+    # ── Step 1: Semantic cache check ──────────────────────────────────────────
+    # This runs BEFORE intent classification, saving ~150ms on a cache hit.
+    cache: Optional[SemanticCache] = get_semantic_cache()
+    if cache:
+        cached_entry = cache.get(question, user.role, department_filter)
+        if cached_entry:
+            result = _result_from_cache(cached_entry, question)
+            _memory.append(
+                session_id=effective_session,
+                user_message=question,
+                assistant_message=result.answer[:500],
+            )
+            logger.info(
+                f"Cache HIT returned — ns={user.role}:{department_filter or ''!r} "
+                f"sim={cached_entry.similarity} user={user.username!r}"
+            )
+            return result
+
+    # ── Step 2: Intent classification ─────────────────────────────────────────
     history = _memory.get(effective_session)
 
     t_classify_start = time.perf_counter()
@@ -337,7 +363,7 @@ def route_query(
         f"classify_ms={classify_ms:.0f}"
     )
 
-    # ── Build RouteContext ────────────────────────────────────────────────────
+    # ── Step 3: Build context and dispatch ────────────────────────────────────
     ctx = RouteContext(
         question=question,
         user=user,
@@ -346,26 +372,22 @@ def route_query(
         target_doc=target_doc,
     )
 
-    # ── Dispatch ──────────────────────────────────────────────────────────────
     if intent == Intent.SMALL_TALK:
         result = SmallTalkHandler().handle(ctx)
 
     elif intent == Intent.SUMMARIZATION:
         result = SummarizationHandler().handle(ctx)
 
-    else:  # DEEP_RAG (default / fallback)
+    else:
         if query_engine is None:
             logger.error("DeepRAG route selected but no query_engine provided — fallback to SmallTalk")
             result = SmallTalkHandler().handle(ctx)
         else:
             result = DeepRagHandler().handle(ctx)
 
-    # ── Update conversation memory ────────────────────────────────────────────
-    # We store every turn so follow-up questions have context.
-    # Note: DEEP_RAG answers include source citations — strip them for cleaner history.
+    # ── Step 4: Update conversation memory ────────────────────────────────────
     answer_for_memory = result.answer
     if result.route_type == "deep_rag" and result.sources:
-        # Truncate long RAG answers in memory to save space
         answer_for_memory = result.answer[:500] + ("…" if len(result.answer) > 500 else "")
 
     _memory.append(
@@ -374,14 +396,24 @@ def route_query(
         assistant_message=answer_for_memory,
     )
 
+    # ── Step 5: Write to cache (non-small-talk results only) ──────────────────
+    if cache and result.route_type not in ("small_talk",):
+        cache.set(
+            question=question,
+            answer=result.answer,
+            sources=result.sources,
+            route_type=result.route_type,
+            role=user.role,
+            dept_filter=department_filter,
+        )
+
+    result.latency_ms = round(result.latency_ms + classify_ms, 1)
+
     logger.info(
         f"Router complete: route={result.route_type!r} "
-        f"total_ms={result.latency_ms + classify_ms:.0f} "
-        f"(classify={classify_ms:.0f} + handle={result.latency_ms:.0f})"
+        f"total_ms={result.latency_ms:.0f} "
+        f"(classify={classify_ms:.0f} + handle={result.latency_ms - classify_ms:.0f})"
     )
-
-    # Attach classify overhead to total for observability
-    result.latency_ms = round(result.latency_ms + classify_ms, 1)
 
     return result
 
@@ -389,29 +421,65 @@ def route_query(
 # ── Streaming variant ─────────────────────────────────────────────────────────
 
 async def route_query_stream(
-    question: str,
-    user: CurrentUser,
-    session_id: Optional[str] = None,
+    question:          str,
+    user:              CurrentUser,
+    session_id:        Optional[str] = None,
     query_engine=None,
+    department_filter: Optional[str] = None,
 ):
     """
     Async generator version of route_query for the SSE streaming endpoint.
 
-    Yields string tokens for small_talk and deep_rag, then a final
-    [ROUTE_TYPE] event and a [SOURCES] event.
+    Cache-hit SSE sequence:
+        data: [ROUTE]cache_hit\\n\\n
+        data: [CACHE]<similarity_score>\\n\\n
+        data: <word1> \\n\\n
+        data: <word2> \\n\\n
+        ...
+        data: [SOURCES]{...}\\n\\n
+        data: [DONE]\\n\\n
 
-    For summarization, the LLM doesn't support token-level streaming cleanly
-    over the concatenated document, so we yield the full answer in one chunk.
+    Cache-miss SSE sequence (unchanged from Feature 4):
+        data: [ROUTE]<intent>\\n\\n
+        data: <token>...\\n\\n
+        data: [SOURCES]{...}\\n\\n
+        data: [DONE]\\n\\n
     """
+    import json as _json
     effective_session = session_id or user.username
+
+    # ── Cache check ───────────────────────────────────────────────────────────
+    cache: Optional[SemanticCache] = get_semantic_cache()
+    if cache:
+        cached_entry = cache.get(question, user.role, department_filter)
+        if cached_entry:
+            yield f"data: [ROUTE]cache_hit\n\n"
+            # Send a cache metadata event so the UI can show the similarity score
+            yield f"data: [CACHE]{cached_entry.similarity:.4f}\n\n"
+
+            # Stream the cached answer word-by-word for natural UX
+            # (feels like a fast stream rather than a wall of text appearing)
+            words = cached_entry.answer.split(" ")
+            for i, word in enumerate(words):
+                # Add space back except after last word
+                token = word + (" " if i < len(words) - 1 else "")
+                yield f"data: {token}\n\n"
+
+            _memory.append(
+                session_id=effective_session,
+                user_message=question,
+                assistant_message=cached_entry.answer[:500],
+            )
+            yield f"data: [SOURCES]{_json.dumps({'sources': cached_entry.sources})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    # ── Cache miss: run full pipeline ─────────────────────────────────────────
     history = _memory.get(effective_session)
 
     t_classify_start = time.perf_counter()
     intent, confidence, target_doc = classify_intent(question, history)
-    classify_ms = (time.perf_counter() - t_classify_start) * 1000
 
-    # Immediately yield the route type so the UI can show a routing indicator
-    import json as _json
     yield f"data: [ROUTE]{intent.value}\n\n"
 
     ctx = RouteContext(
@@ -422,11 +490,10 @@ async def route_query_stream(
         target_doc=target_doc,
     )
 
-    answer = ""
+    answer  = ""
     sources: list[dict] = []
 
     if intent == Intent.SMALL_TALK:
-        # Stream token-by-token from OpenAI
         from openai import OpenAI as _OAI
         from retrieval.handlers import _SMALL_TALK_SYSTEM, _history_to_messages
 
@@ -449,14 +516,12 @@ async def route_query_stream(
                 yield f"data: {delta}\n\n"
 
     elif intent == Intent.SUMMARIZATION:
-        # Non-streaming for summarization (fetching chunks is synchronous)
         result = SummarizationHandler().handle(ctx)
-        answer = result.answer
+        answer  = result.answer
         sources = result.sources
         yield f"data: {answer}\n\n"
 
     else:
-        # DeepRAG — LlamaIndex streaming
         if query_engine is None:
             answer = "I'm unable to retrieve documents right now."
             yield f"data: {answer}\n\n"
@@ -466,28 +531,37 @@ async def route_query_stream(
                 answer += token
                 yield f"data: {token}\n\n"
 
-            # Extract sources
             seen: set[str] = set()
             for node in getattr(streaming_response, "source_nodes", []):
                 meta = node.node.metadata
-                src = meta.get("source", "unknown")
+                src  = meta.get("source", "unknown")
                 if src not in seen:
                     seen.add(src)
                     sources.append({
-                        "source": src,
-                        "department": meta.get("department", "general"),
+                        "source":       src,
+                        "department":   meta.get("department", "general"),
                         "allowed_roles": meta.get("allowed_roles", []),
                         "text_snippet": node.node.text[:300].replace("\n", " "),
-                        "score": round(node.score or 0.0, 4),
+                        "score":        round(node.score or 0.0, 4),
                     })
 
-    # Update memory
+    # Update conversation memory
     _memory.append(
         session_id=effective_session,
         user_message=question,
         assistant_message=answer[:500],
     )
 
-    # Final SSE events
+    # Write to cache (never small_talk)
+    if cache and intent != Intent.SMALL_TALK and answer:
+        cache.set(
+            question=question,
+            answer=answer,
+            sources=sources,
+            route_type=intent.value,
+            role=user.role,
+            dept_filter=department_filter,
+        )
+
     yield f"data: [SOURCES]{_json.dumps({'sources': sources})}\n\n"
     yield "data: [DONE]\n\n"

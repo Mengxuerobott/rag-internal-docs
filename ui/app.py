@@ -43,9 +43,10 @@ PLACEHOLDER_QUESTIONS = [
 ]
 
 ROUTE_BADGES = {
-    "small_talk":    ("💬", "Conversational", "#2196F3"),
-    "summarization": ("📄", "Full-doc summary", "#FF9800"),
-    "deep_rag":      ("🔍", "Deep retrieval", "#4CAF50"),
+    "small_talk":    ("💬", "Conversational",  "#2196F3"),
+    "summarization": ("📄", "Full-doc summary","#FF9800"),
+    "deep_rag":      ("🔍", "Deep retrieval",  "#4CAF50"),
+    "cache_hit":     ("⚡", "Cache hit",        "#9C27B0"),
 }
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -64,6 +65,7 @@ for key, default in [
     ("jwt_token", None),
     ("username", None),
     ("user_role", None),
+    ("cache_similarity", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -176,6 +178,10 @@ def stream_query(question: str, department_filter: Optional[str] = None):
                     if chunk.startswith("[ROUTE]"):
                         yield ("route", chunk[len("[ROUTE]"):])
 
+                    elif chunk.startswith("[CACHE]"):
+                        # Cache similarity score — e.g. "[CACHE]0.9742"
+                        yield ("cache", chunk[len("[CACHE]"):])
+
                     elif chunk.startswith("[SOURCES]"):
                         try:
                             sources = json.loads(chunk[len("[SOURCES]"):]).get("sources", [])
@@ -263,8 +269,24 @@ with st.sidebar:
         st.markdown(f"{icon} **{label}** — `{rt}`")
     st.caption(
         "The router classifies each query and dispatches it to the cheapest "
-        "appropriate pipeline. Small talk bypasses vector search entirely."
+        "appropriate pipeline. ⚡ cache hits return in ~100ms at zero LLM cost."
     )
+
+    # Cache stats
+    try:
+        stats_r = httpx.get(f"{API_BASE}/cache/stats", headers=_auth_headers(), timeout=5.0)
+        if stats_r.status_code == 200:
+            stats = stats_r.json()
+            if stats.get("enabled"):
+                hit_rate = stats.get("hit_rate", 0)
+                total    = stats.get("total_hits", 0) + stats.get("total_misses", 0)
+                st.metric(
+                    "Cache hit rate",
+                    f"{hit_rate*100:.1f}%",
+                    help=f"{stats.get('total_hits',0)} hits / {total} total queries"
+                )
+    except Exception:
+        pass
     st.divider()
 
     # Department filter
@@ -371,8 +393,17 @@ if user_input and api_ok:
             ):
                 if event_type == "route":
                     final_route = data
-                    # Show routing badge immediately before first token
                     route_placeholder.caption(_route_badge(final_route))
+
+                elif event_type == "cache":
+                    # Cache similarity score arrived — update badge with score
+                    try:
+                        sim = float(data)
+                        route_placeholder.caption(
+                            f"{_route_badge('cache_hit')}  ·  sim={sim:.3f}"
+                        )
+                    except ValueError:
+                        pass
 
                 elif event_type == "token":
                     accumulated += data

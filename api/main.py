@@ -62,6 +62,7 @@ from retrieval.query_engine import (
     set_index,
 )
 from retrieval.router import route_query, route_query_stream, get_memory
+from cache.semantic_cache import init_semantic_cache, get_semantic_cache
 from webhooks.router import router as webhook_router
 
 
@@ -73,6 +74,7 @@ async def lifespan(app: FastAPI):
     try:
         index = get_or_build_index()
         set_index(index)
+        init_semantic_cache()
         elapsed = time.perf_counter() - start
         logger.info(f"Index ready in {elapsed:.1f}s")
     except Exception as e:
@@ -137,7 +139,11 @@ class QueryResponse(BaseModel):
     user_role: str
     route_type: str = Field(
         description="Which pipeline handled this query: "
-                    "small_talk | summarization | deep_rag"
+                    "small_talk | summarization | deep_rag | cache_hit"
+    )
+    cache_hit: bool = Field(
+        default=False,
+        description="True when the answer was served from the semantic cache.",
     )
 
 
@@ -298,6 +304,7 @@ async def query(
             user=user,
             session_id=req.session_id,
             query_engine=query_engine,
+            department_filter=req.department_filter,
         )
 
         logger.info(
@@ -312,6 +319,7 @@ async def query(
             latency_ms=result.latency_ms,
             user_role=user.role,
             route_type=result.route_type,
+            cache_hit=(result.route_type == "cache_hit"),
         )
 
     except Exception as e:
@@ -346,6 +354,7 @@ async def query_stream(
                 user=user,
                 session_id=req.session_id,
                 query_engine=query_engine,
+                department_filter=req.department_filter,
             ):
                 yield chunk
         except Exception as e:
@@ -476,3 +485,70 @@ async def docs_list(user: CurrentUser = Depends(get_current_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ── Cache endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/cache/stats", tags=["cache"])
+async def cache_stats(user: CurrentUser = Depends(get_current_user)):
+    """
+    Return semantic cache statistics.
+
+    Accessible to all authenticated users — useful for observing cache
+    effectiveness in the UI.
+    """
+    cache = get_semantic_cache()
+    if cache is None:
+        return {
+            "enabled": False,
+            "reason": "Cache disabled or Redis unavailable",
+        }
+    stats = cache.stats()
+    return {
+        "enabled":        stats.enabled,
+        "total_hits":     stats.total_hits,
+        "total_misses":   stats.total_misses,
+        "hit_rate":       stats.hit_rate,
+        "namespace_sizes": stats.namespace_sizes,
+        "threshold":      stats.threshold,
+        "ttl_seconds":    stats.ttl_seconds,
+    }
+
+
+@app.delete("/cache", tags=["cache"])
+async def flush_cache(user: CurrentUser = Depends(get_current_user)):
+    """
+    Flush the entire semantic cache. Admin role required.
+
+    Call this after bulk document ingestion to ensure stale cached answers
+    are not served. The cache warms back up automatically as users ask questions.
+    """
+    _require_admin(user)
+    cache = get_semantic_cache()
+    if cache is None:
+        return {"status": "cache_disabled"}
+
+    n_deleted = cache.invalidate_all()
+    logger.info(f"Cache flushed by {user.username} — {n_deleted} keys deleted")
+    return {"status": "flushed", "keys_deleted": n_deleted}
+
+
+@app.delete("/cache/{role}", tags=["cache"])
+async def flush_cache_namespace(
+    role: str,
+    dept_filter: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Flush the cache for a specific role namespace. Admin role required.
+
+    More surgical than /cache DELETE — use when you know only a specific
+    role group's documents have changed (e.g. only HR docs were updated).
+    """
+    _require_admin(user)
+    cache = get_semantic_cache()
+    if cache is None:
+        return {"status": "cache_disabled"}
+
+    n_deleted = cache.invalidate_namespace(role, dept_filter)
+    return {"status": "flushed", "role": role, "dept_filter": dept_filter, "keys_deleted": n_deleted}
+

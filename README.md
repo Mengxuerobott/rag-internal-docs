@@ -37,6 +37,7 @@ engineering stack.
 | LLM | GPT-4o / Claude Sonnet | Configurable via `.env` |
 | Agentic router | GPT-4o-mini (classifier) | Intent classification routes queries to cheapest appropriate pipeline |
 | Agentic router | GPT-4o-mini (intent classifier) | Routes each query to the cheapest pipeline: small_talk / summarization / deep_rag |
+| Semantic cache | Redis + numpy cosine similarity | RBAC-aware query cache — returns cached answers in ~100ms at zero LLM cost |
 | Multimodal | GPT-4o-mini (vision) | Table summarisation + image/chart description via VLM at ingestion time |
 | Evaluation | [RAGAS](https://github.com/explodinggradients/ragas) | Objective RAG metrics: faithfulness, relevancy, precision, recall |
 | Observability | [LangSmith](https://smith.langchain.com/) | Full trace of every chain execution |
@@ -80,6 +81,14 @@ Bi-encoder embeddings compare query and chunk independently; cross-encoders
 read the (query, chunk) pair together — a much harder relevance judgment.
 Cohere v3 dropped the average context window from 10 → 3 chunks while
 raising faithfulness by 18 percentage points.
+
+**RBAC-scoped semantic caching instead of a flat query cache**
+A naive Redis `SET query_text → answer` cache would serve an HR user's confidential
+answer to an engineering user who asks the same question. The cache is namespaced
+by `(user.role, dept_filter)` so each RBAC partition has its own vector index.
+The similarity threshold (0.92) was chosen empirically: it catches natural
+paraphrases like "2026 company holidays" ≈ "public holidays this year" while
+rejecting topically different questions.
 
 **Multimodal table summarisation instead of raw markdown embedding**
 Standard chunkers split markdown tables mid-row, and even intact raw tables produce weak vectors (`| 12 | 18 | 9 |` has no semantic meaning). Instead, each table is sent to GPT-4o-mini during ingestion to produce a natural-language summary. The summary is what gets embedded; the original markdown is stored in `node.metadata["original_table"]` and injected verbatim into the LLM's context window during answer synthesis. Cost: ~$0.001 per table, one-time at ingestion.
@@ -132,6 +141,7 @@ rag-internal-docs/
 │   ├── test_ingestion.py  # Unit tests for loader + chunker
 │   ├── test_router.py     # Intent classification, conversation memory, handler dispatch
 │   ├── test_router.py     # Intent classification, memory, handler dispatch, API integration
+│   ├── test_cache.py      # Semantic cache: miss/hit, RBAC isolation, router integration
 │   ├── test_multimodal.py # Table extraction, VLM summarisation, chunker merge
 │   ├── test_rbac.py       # Role expansion, permission stamping, JWT + API enforcement
 │   ├── test_webhooks.py   # HMAC verification, webhook payloads, worker job logic
@@ -291,6 +301,48 @@ The `route_type` field in every response shows which path was taken:
 {"answer": "...", "route_type": "summarization", "latency_ms": 490}
 {"answer": "...", "route_type": "deep_rag", "latency_ms": 1380}
 ```
+
+## Semantic caching
+
+Every query is checked against the Redis cache **before** intent classification.
+
+```
+User query
+    │
+    ▼
+embed(query)  ← text-embedding-3-small, ~100ms
+    │
+    ▼
+cosine_similarity(query_vec, all_cached_vecs[role][dept])
+    │
+    ├──► sim ≥ 0.92  →  return cached answer   (~100ms total, $0 LLM cost)
+    │
+    └──► sim < 0.92  →  run full pipeline  →  write result to cache
+```
+
+**RBAC-aware namespacing** — cache is partitioned by `(user.role, dept_filter)`.
+An HR user's answer to a confidential question is never served to an engineering
+user through the cache. This means two users with different roles always get
+answers generated for their own permission set.
+
+**What gets cached:** `deep_rag` and `summarization` results only.
+`small_talk` is never cached — it's conversational, session-specific, and cheap.
+
+**Cache invalidation:**
+- Time-based: every entry expires after `SEMANTIC_CACHE_TTL_SECONDS` (default 24h).
+- Event-driven: set `INVALIDATE_CACHE_ON_INGEST=true` to flush on every document update.
+- Manual: `DELETE /cache` (admin) or `DELETE /cache/{role}` (scoped).
+
+Configure in `.env`:
+```bash
+SEMANTIC_CACHE_ENABLED=true
+SEMANTIC_CACHE_SIMILARITY_THRESHOLD=0.92  # tune: 0.85=aggressive, 0.99=exact-only
+SEMANTIC_CACHE_TTL_SECONDS=86400          # 24 hours
+SEMANTIC_CACHE_MAX_ENTRIES=10000          # LRU eviction above this
+INVALIDATE_CACHE_ON_INGEST=false
+```
+
+---
 
 ## Agentic routing
 

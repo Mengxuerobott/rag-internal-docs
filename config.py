@@ -100,6 +100,42 @@ class Settings:
     # Oldest sessions are evicted when this limit is reached.
     CONVERSATION_MAX_SESSIONS: int = int(os.getenv("CONVERSATION_MAX_SESSIONS", "1000"))
 
+    # ── Semantic cache ───────────────────────────────────────────────────────
+    # Set to "false" to disable the cache entirely (useful during development
+    # when you want every request to go through the full pipeline).
+    SEMANTIC_CACHE_ENABLED: bool = os.getenv("SEMANTIC_CACHE_ENABLED", "true").lower() == "true"
+
+    # Cosine similarity threshold for a cache hit.
+    # 0.92 is a good default: catches paraphrases ("company holidays 2026" ≈
+    # "2026 public holidays") but rejects topically different questions.
+    # Raise toward 0.99 for exact-only matching; lower toward 0.85 for more
+    # aggressive caching (risk of serving a subtly wrong cached answer).
+    SEMANTIC_CACHE_SIMILARITY_THRESHOLD: float = float(
+        os.getenv("SEMANTIC_CACHE_SIMILARITY_THRESHOLD", "0.92")
+    )
+
+    # How long a cache entry lives in Redis before automatic expiry.
+    # Default: 24 hours.  Set to 0 to disable TTL (entries live forever until
+    # manually evicted or Redis is flushed).
+    SEMANTIC_CACHE_TTL_SECONDS: int = int(
+        os.getenv("SEMANTIC_CACHE_TTL_SECONDS", str(24 * 3600))
+    )
+
+    # Maximum number of entries per (role, department_filter) namespace.
+    # When this limit is reached, the oldest entry is evicted (LRU-style).
+    # Default: 10 000 — at 1536 floats × 4 bytes each = ~60 KB per entry,
+    # 10 000 entries = ~600 MB RAM.  Reduce if memory is constrained.
+    SEMANTIC_CACHE_MAX_ENTRIES: int = int(
+        os.getenv("SEMANTIC_CACHE_MAX_ENTRIES", "10000")
+    )
+
+    # Whether to flush the entire cache after every document ingestion event.
+    # Ensures stale answers are never served after a policy document is updated.
+    # Small performance cost (cache cold-starts after every ingest).
+    INVALIDATE_CACHE_ON_INGEST: bool = (
+        os.getenv("INVALIDATE_CACHE_ON_INGEST", "false").lower() == "true"
+    )
+
     # ── API ───────────────────────────────────────────────────────────────────
     API_HOST: str = os.getenv("API_HOST", "0.0.0.0")
     API_PORT: int = int(os.getenv("API_PORT", "8000"))
