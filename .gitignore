@@ -52,3 +52,4 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+rag/
