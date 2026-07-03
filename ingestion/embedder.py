@@ -40,7 +40,7 @@ from llama_index.llms.openai import OpenAI
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from loguru import logger
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, VectorParams
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, VectorParams, SparseVectorParams
 
 from config import settings
 from ingestion.chunker import build_all_nodes, build_hierarchical_nodes
@@ -85,7 +85,8 @@ def ensure_collection(client: QdrantClient, collection_name: str) -> None:
     dim = dim_map.get(settings.EMBEDDING_MODEL, 1536)
     client.create_collection(
         collection_name=collection_name,
-        vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+        vectors_config={"text-dense": VectorParams(size=dim, distance=Distance.COSINE)},
+        sparse_vectors_config={"text-sparse-new": SparseVectorParams()},
     )
     logger.info(f"Created Qdrant collection '{collection_name}' ({dim}d cosine)")
 
