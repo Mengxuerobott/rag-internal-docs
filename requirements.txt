@@ -37,3 +37,13 @@ loguru==0.7.2
 httpx==0.27.2
 tenacity==8.5.0
 rich==13.9.4
+
+# ── Auth (JWT + password hashing) ─────────────────────────────
+python-jose==3.5.0
+passlib==1.7.4
+bcrypt==4.0.1
+
+# ── Cache + worker (Redis, ARQ) ───────────────────────────────
+redis==5.3.1
+hiredis==3.4.0
+arq==0.28.0

@@ -88,6 +88,16 @@ def ensure_collection(client: QdrantClient, collection_name: str) -> None:
         vectors_config={"text-dense": VectorParams(size=dim, distance=Distance.COSINE)},
         sparse_vectors_config={"text-sparse-new": SparseVectorParams()},
     )
+    client.create_payload_index(
+        collection_name=collection_name,
+        field_name="allowed_roles",
+        field_schema="keyword",
+    )
+    client.create_payload_index(
+        collection_name=collection_name,
+        field_name="department",
+        field_schema="keyword",
+    )
     logger.info(f"Created Qdrant collection '{collection_name}' ({dim}d cosine)")
 
 

@@ -366,8 +366,27 @@ class DeepRagHandler:
 
         if ctx.query_engine is None:
             raise RuntimeError("DeepRagHandler requires ctx.query_engine to be set")
-
-        response = ctx.query_engine.query(ctx.question)
+	
+	# RBAC pre-filter may exclude every chunk for this user's role.
+        # The retriever raises when zero results match, so catch that and
+        # return a clean denial instead of a 500.
+        try:
+            response = ctx.query_engine.query(ctx.question)
+        except ValueError as e:
+            if "at least one of nodes or ids" in str(e):
+                latency = (time.perf_counter() - start) * 1000
+                logger.info(
+                    f"DeepRAG route: user={ctx.user.username!r} "
+                    f"no accessible documents (RBAC filtered all results)"
+                )
+                return RouteResult(
+                    answer="You don't have access to any documents relevant to this question.",
+                    route_type="deep_rag",
+                    sources=[],
+                    latency_ms=round(latency, 1),
+                )
+            raise
+        
         answer = str(response)
         latency = (time.perf_counter() - start) * 1000
 
