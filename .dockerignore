@@ -1,0 +1,11 @@
+.env
+*.env.local
+rag/
+.venv/
+venv/
+.git/
+__pycache__/
+*.pyc
+data/index_store/
+qdrant_storage/
+.pytest_cache/
