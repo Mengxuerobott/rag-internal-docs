@@ -1,245 +1,172 @@
 # Enterprise Document RAG System
 
-A production-grade Retrieval-Augmented Generation (RAG) system for querying
-company internal documents using natural language. Built with the 2026 AI
-engineering stack.
+A Retrieval-Augmented Generation service for asking natural-language questions about a company's internal documents. It returns answers with source citations and enforces role-based access control, so a user only ever sees answers drawn from documents their role is allowed to read.
 
----
+The retrieval side uses hybrid search (keyword + vector) with an AutoMerging retriever and a cross-encoder reranker. The service is containerized and runs on AWS ECS Fargate against a managed Qdrant vector store.
 
-## Architecture
+## How it works
 
-```
-┌──────────────────── Ingestion Pipeline ─────────────────────────┐
-│  Documents  →  LlamaParse  →  Hierarchical Chunking  →  Qdrant  │
-│  (PDF/DOCX)    (extraction)    (2048 / 512 / 128 tok)   (embed) │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌──────────────────── Retrieval Pipeline ─────────────────────────┐
-│  User Query                                                       │
-│      → Query rewrite (HyDE)                                      │
-│      → Hybrid search: BM25 + vector (Qdrant, RRF fusion)        │
-│      → AutoMerging Retriever (leaf → parent context swap)        │
-│      → Cohere Reranker v3 (cross-encoder, top 10 → top 3)       │
-│      → GPT-4o / Claude  →  Streaming answer + citations         │
-└─────────────────────────────────────────────────────────────────┘
-```
+Ingestion loads documents, chunks them hierarchically (parent and leaf sizes), embeds them with OpenAI, and stores dense and sparse vectors in Qdrant. Each chunk is tagged with the roles allowed to see it and the department it came from.
 
----
+At query time, the request is authenticated (JWT) and routed by intent. A knowledge question goes through the full pipeline: hybrid BM25 + vector retrieval with Reciprocal Rank Fusion, an AutoMerging step that swaps matched leaf chunks for their larger parent chunks to restore context, a Cohere cross-encoder rerank that keeps the top few, and finally answer synthesis with inline citations. RBAC is applied as a Qdrant payload filter before retrieval, not after, so restricted documents never enter the candidate set.
 
-## Tech Stack
+## Stack
 
-| Layer | Tool | Reason |
-|-------|------|--------|
-| RAG framework | [LlamaIndex](https://github.com/run-llama/llama_index) | Best retrieval accuracy for document-heavy RAG (92% vs 85% vs LangChain) |
-| Vector database | [Qdrant](https://qdrant.tech/) | Rust-based, best filtered search performance, free 1 GB cloud tier |
-| Embeddings | OpenAI `text-embedding-3-small` | Industry standard, 1536-dim, strong MTEB benchmarks |
-| Reranker | [Cohere Rerank v3](https://cohere.com/) | Cross-encoder, +18pp faithfulness gain in eval |
-| LLM | GPT-4o / Claude Sonnet | Configurable via `.env` |
-| Agentic router | GPT-4o-mini (classifier) | Intent classification routes queries to cheapest appropriate pipeline |
-| Agentic router | GPT-4o-mini (intent classifier) | Routes each query to the cheapest pipeline: small_talk / summarization / deep_rag |
-| Semantic cache | Redis + numpy cosine similarity | RBAC-aware query cache — returns cached answers in ~100ms at zero LLM cost |
-| Multimodal | GPT-4o-mini (vision) | Table summarisation + image/chart description via VLM at ingestion time |
-| Evaluation | [RAGAS](https://github.com/explodinggradients/ragas) | Objective RAG metrics: faithfulness, relevancy, precision, recall |
-| Observability | [LangSmith](https://smith.langchain.com/) | Full trace of every chain execution |
-| Backend | FastAPI + uvicorn | Async, streaming SSE responses |
-| Frontend | Streamlit | Chat UI with source citations |
-| Container | Docker Compose | One-command local setup |
+- Retrieval framework: LlamaIndex
+- Vector database: Qdrant (Qdrant Cloud free tier in the deployed version)
+- Embeddings: OpenAI `text-embedding-3-small` (1536-dim)
+- Sparse model: SPLADE (`prithvida/Splade_PP_en_v1`) for the keyword side of hybrid search
+- Reranker: Cohere Rerank v3 (cross-encoder)
+- LLM: OpenAI (configurable in `.env`)
+- Evaluation: RAGAS
+- API: FastAPI with streaming (SSE) responses
+- UI: Streamlit
+- Auth: JWT with role-based access control
+- Packaging: Docker; deployed on AWS ECS Fargate with the image in Amazon ECR
 
----
+## Evaluation
 
-## Evaluation Results (RAGAS)
+Measured with RAGAS on a set of hand-labelled question/answer pairs across the sample document categories.
 
-Evaluated on 20 hand-labelled question/answer pairs over 6 internal document categories.
+| Metric | Score |
+| --- | --- |
+| Faithfulness | 0.91 |
+| Answer relevancy | 0.89 |
+| Context precision | 0.84 |
+| Context recall | 0.82 |
 
-| Metric | Score | Target |
-|--------|-------|--------|
-| **Faithfulness** | **0.91** | ≥ 0.88 |
-| **Answer Relevancy** | **0.89** | ≥ 0.85 |
-| **Context Precision** | **0.84** | ≥ 0.80 |
-| **Context Recall** | **0.82** | ≥ 0.75 |
-| Avg query latency | 1.4s | — |
+Adding the Cohere reranker was the single biggest change: faithfulness went from 0.73 to 0.91. The reranker pushes the genuinely relevant chunks to the top, so the model sees cleaner context and has less room to make things up.
 
-> Faithfulness increased from 0.73 → 0.91 after adding the Cohere reranker.
+Numbers are from this project's own eval set and are meant to show the relative effect of each component, not to be a general benchmark.
 
----
+## Design notes
 
-## Key Engineering Decisions
+**Hierarchical chunking.** Small leaf chunks are indexed so retrieval can match precisely, but small chunks lose surrounding context. The AutoMerging retriever handles this: when several leaf chunks under the same parent are retrieved, it returns the parent instead, so the model gets the full passage rather than a fragment.
 
-**Hierarchical chunking over fixed-size chunking**
-Small leaf chunks (128 tokens) are indexed for precision retrieval; the
-AutoMerging Retriever swaps matched leaf clusters for their parent chunks
-(512 tokens) before the LLM call. This gives needle-sharp retrieval without
-losing sentence context.
+**Hybrid search.** Vector search alone misses exact-string matches like product codes, acronyms, and proper nouns. BM25 catches those. Reciprocal Rank Fusion merges the two ranked lists without needing the scores to be on the same scale.
 
-**Hybrid search (BM25 + vector)**
-Pure vector search misses exact-match queries (product codes, acronyms, names).
-BM25 catches those. Reciprocal Rank Fusion merges both ranked lists.
-The 50/50 alpha blend was tuned empirically using RAGAS context precision.
+**Cross-encoder rerank.** The first-stage retriever embeds the query and each chunk separately, which is fast but approximate. The reranker reads each (query, chunk) pair together, which is a better relevance judgment, so it runs only on the shortlist from the first stage.
 
-**Cross-encoder reranker as a second-stage filter**
-Bi-encoder embeddings compare query and chunk independently; cross-encoders
-read the (query, chunk) pair together — a much harder relevance judgment.
-Cohere v3 dropped the average context window from 10 → 3 chunks while
-raising faithfulness by 18 percentage points.
+**RBAC as a pre-filter.** Access rules are stored on each chunk and applied as a Qdrant filter before the vector search runs, so a user's query is only ever compared against documents they are allowed to see.
 
-**RBAC-scoped semantic caching instead of a flat query cache**
-A naive Redis `SET query_text → answer` cache would serve an HR user's confidential
-answer to an engineering user who asks the same question. The cache is namespaced
-by `(user.role, dept_filter)` so each RBAC partition has its own vector index.
-The similarity threshold (0.92) was chosen empirically: it catches natural
-paraphrases like "2026 company holidays" ≈ "public holidays this year" while
-rejecting topically different questions.
+## Deployment (AWS ECS Fargate)
 
-**Multimodal table summarisation instead of raw markdown embedding**
-Standard chunkers split markdown tables mid-row, and even intact raw tables produce weak vectors (`| 12 | 18 | 9 |` has no semantic meaning). Instead, each table is sent to GPT-4o-mini during ingestion to produce a natural-language summary. The summary is what gets embedded; the original markdown is stored in `node.metadata["original_table"]` and injected verbatim into the LLM's context window during answer synthesis. Cost: ~$0.001 per table, one-time at ingestion.
+The API is packaged as a container and runs on Fargate. A few notes that matter if you deploy it yourself:
 
-**Image descriptions pre-computed at ingestion, not at query time**
-Running a VLM at query time (per-request) would add 2-5 seconds of latency for every question. Instead, GPT-4o-mini describes every chart and diagram once during ingestion — the description is embedded and retrieved like any other chunk. This trades a small up-front cost for zero extra query latency.
+- Build the image for `linux/amd64`. If you build on an Apple Silicon Mac, pass `--platform linux/amd64` or the container will not run on Fargate.
+- The SPLADE sparse model is downloaded during the image build and baked into the image, so the container does not fetch it at startup. Downloading it at runtime inside the container was unreliable.
+- Secrets (API keys, Qdrant URL) are passed as environment variables in the ECS task definition, not baked into the image. `.env` and the task definition file are gitignored.
+- Hybrid mode loads the SPLADE model in addition to building the index, so the task needs more memory than a minimal container; 4 GB was enough, 2 GB was not.
+- The semantic cache (Redis) is enabled locally but turned off in the deployed version to avoid running a managed Redis instance. The caching code is still in the repo.
 
-**Multimodal nodes skip re-chunking**
-Table summaries and image descriptions are self-contained semantic units. Splitting a table summary mid-sentence destroys its meaning. `build_all_nodes()` in `chunker.py` treats multimodal nodes as leaf-level by default and merges them directly into the leaf set, bypassing the hierarchical splitter entirely.
-
-**Agentic routing instead of a fixed pipeline**
-Every query previously triggered hybrid search + AutoMerging + Cohere Reranker + GPT-4o (~1500ms). A greeting like "hi" wasted the entire stack. The intent classifier (one gpt-4o-mini call, ~100ms) routes to the cheapest appropriate handler: direct LLM reply for small-talk, a Qdrant scroll + summarisation for "summarise X" requests, and the full pipeline only for genuine knowledge retrieval questions. The classifier call is recovered in latency on 30-40% of production queries.
-
-**Structured JSON intent output extracts target_doc in the same call**
-The summarisation handler needs to know which document to fetch. Rather than a second LLM call to resolve "leave policy" → "leave_policy.md", the classifier prompt instructs the model to output `target_doc` in its JSON response. One call, two outputs.
-
-**Conversation memory is session-scoped, not query-scoped**
-SmallTalk and Summarization routes receive the last N turns as context. DeepRAG deliberately receives no history — injecting previous conversation into a vector query degrades retrieval precision (the query embedding shifts toward the history topics rather than the current question). Memory is stored per-session-id in a thread-safe LRU dict; in production this would be Redis.
-
-**Streaming SSE responses**
-The FastAPI backend streams tokens via Server-Sent Events so the UI renders
-each word as it arrives. Source citations are sent as a final structured SSE
-event after the last token.
-
----
-
-## Project Structure
+## Project layout
 
 ```
 rag-internal-docs/
-├── ingestion/
-│   ├── loader.py          # LlamaParse + multimodal pipeline orchestration
-│   ├── chunker.py         # Hierarchical chunking + multimodal node merge
-│   ├── embedder.py        # Qdrant build/reload + upsert_document
-│   └── multimodal.py      # Table summarisation + image VLM description
-├── retrieval/
-│   ├── router.py          # Intent classifier + dispatch + conversation memory
-│   ├── handlers.py        # SmallTalkHandler, SummarizationHandler, DeepRagHandler
-│   ├── query_engine.py    # Hybrid search + AutoMerging + Cohere reranker
-│   └── reranker.py        # Reranker utilities + debug wrapper
-├── api/
-│   └── main.py            # FastAPI: /query, /query/stream, /ingest, /health
-├── ui/
-│   └── app.py             # Streamlit chat UI with source citations
-├── eval/
-│   └── ragas_eval.py      # RAGAS evaluation suite
-├── scripts/
-│   └── generate_sample_docs.py   # Creates realistic fake internal docs
-├── tests/
-│   ├── test_ingestion.py  # Unit tests for loader + chunker
-│   ├── test_router.py     # Intent classification, conversation memory, handler dispatch
-│   ├── test_router.py     # Intent classification, memory, handler dispatch, API integration
-│   ├── test_cache.py      # Semantic cache: miss/hit, RBAC isolation, router integration
-│   ├── test_multimodal.py # Table extraction, VLM summarisation, chunker merge
-│   ├── test_rbac.py       # Role expansion, permission stamping, JWT + API enforcement
-│   ├── test_webhooks.py   # HMAC verification, webhook payloads, worker job logic
-│   └── test_api.py        # Integration tests (mocked engine)
-├── config.py              # Central settings from .env
-├── docker-compose.yml
-├── Dockerfile.api
-├── Dockerfile.ui
-└── requirements.txt
+  ingestion/
+    loader.py        document loading, RBAC tagging
+    chunker.py       hierarchical chunking
+    embedder.py      collection setup, Qdrant vector store build/reload
+  retrieval/
+    query_engine.py  hybrid search + AutoMerging + reranker
+    reranker.py      reranker helpers
+    handlers.py      per-intent query handlers
+    router.py        intent routing
+  api/
+    main.py          FastAPI app: /query, /query/stream, /ingest, /health
+  auth/
+    jwt_handler.py   JWT auth
+    rbac.py          role/department access rules
+  cache/
+    semantic_cache.py
+  ui/
+    app.py           Streamlit chat UI
+  eval/
+    ragas_eval.py    RAGAS evaluation
+  scripts/
+    generate_sample_docs.py
+  tests/
+  config.py
+  docker-compose.yml
+  Dockerfile.api
+  Dockerfile.ui
+  requirements.txt
 ```
 
----
+## Running it locally
 
-## Quick Start
+You need Docker Desktop and API keys for OpenAI, Cohere (free tier), and LlamaCloud (free tier).
 
-### Prerequisites
-- Docker Desktop running
-- API keys: [OpenAI](https://platform.openai.com/), [Cohere](https://dashboard.cohere.com/) (free), [LlamaCloud](https://cloud.llamaindex.ai/) (free)
+Clone and configure:
 
-### 1. Clone and configure
-
-```bash
-git clone https://github.com/YOUR_USERNAME/rag-internal-docs.git
+```
+git clone https://github.com/Mengxuerobott/rag-internal-docs.git
 cd rag-internal-docs
 cp .env.example .env
-# Edit .env and fill in your API keys
+# fill in your API keys in .env
 ```
 
-### 2. Generate sample documents
+Generate the sample documents (7 short internal policy docs across HR, engineering, finance, legal, and IT security):
 
-```bash
+```
 pip install -r requirements.txt
 python scripts/generate_sample_docs.py
 ```
 
-This creates 7 realistic internal policy documents across HR, Engineering,
-Finance, Legal, and IT Security. Swap these out for your own PDFs/DOCXs.
+Start everything with Docker Compose:
 
-### 3. Start with Docker Compose
-
-```bash
+```
 docker compose up --build
 ```
 
 | Service | URL |
-|---------|-----|
+| --- | --- |
 | Streamlit UI | http://localhost:8501 |
-| FastAPI (docs) | http://localhost:8000/docs |
+| FastAPI docs | http://localhost:8000/docs |
 | Qdrant dashboard | http://localhost:6333/dashboard |
 
-### 4. Or run locally (no Docker)
+Or run the pieces by hand:
 
-```bash
-# Terminal 1: Qdrant
+```
+# Qdrant
 docker run -p 6333:6333 qdrant/qdrant
 
-# Terminal 2: Ingest documents
+# ingest documents
 python -m ingestion.embedder
 
-# Terminal 3: API
+# API
 uvicorn api.main:app --reload
 
-# Terminal 4: UI
+# UI
 streamlit run ui/app.py
 ```
 
----
+The demo users are defined in `auth/jwt_handler.py`, each with a different role, all with the password `secret`. Logging in as different users shows RBAC in action: an HR user can see the leave policy, a general employee cannot.
 
 ## Ingestion
 
-```bash
-# First-time ingestion (or adding new documents)
+```
+# ingest (or add new documents)
 python -m ingestion.embedder
 
-# Force full rebuild (wipes Qdrant collection and re-embeds everything)
+# wipe the collection and re-embed everything
 python -m ingestion.embedder --force-rebuild
 
-# Ingest from a custom directory
-python -m ingestion.embedder --docs-dir /path/to/your/docs
+# ingest from a different directory
+python -m ingestion.embedder --docs-dir /path/to/docs
 ```
-
----
 
 ## Evaluation
 
-```bash
-# Run RAGAS evaluation (requires API + Qdrant running)
+```
 python -m eval.ragas_eval
-
-# Save results to JSON
 python -m eval.ragas_eval --output results/ragas_scores.json
-
-# Use custom test cases
 python -m eval.ragas_eval --test-cases data/my_test_cases.json
 ```
 
-Test case format (`data/my_test_cases.json`):
-```json
+Test case format:
+
+```
 [
   {
     "question": "What is the parental leave policy?",
@@ -248,241 +175,54 @@ Test case format (`data/my_test_cases.json`):
 ]
 ```
 
----
+## Tests
 
-## Testing
-
-```bash
-# All tests (no external services required — engine is mocked)
+```
 pytest tests/ -v
-
-# Just ingestion unit tests
-pytest tests/test_ingestion.py -v
-
-# Just API integration tests
-pytest tests/test_api.py -v
-
-# With coverage report
 pytest tests/ --cov=. --cov-report=html
 ```
 
----
+The engine is mocked, so the tests do not need external services running.
 
-## Agentic query routing
+## API
 
-Every query is classified before touching the retrieval stack.
-
-```
-User query
-    │
-    ▼  classify_intent()  [gpt-4o-mini, ~100ms, structured JSON]
-    │
-    ├── small_talk    → Direct LLM reply + conversation history    (~150ms total)
-    │                   "hi", "what can you do?", "thanks", follow-up questions
-    │
-    ├── summarization → Qdrant scroll by doc_id/source + LLM      (~500ms total)
-    │                   "summarize the leave policy", "overview of onboarding guide"
-    │                   target_doc extracted by classifier in same call
-    │
-    └── deep_rag      → Hybrid BM25+vector → AutoMerge → Rerank → GPT-4o (~1500ms)
-                        Factual questions, policy lookups, procedural queries
-```
-
-Configure in `.env`:
-```bash
-ROUTER_MODEL=gpt-4o-mini          # classifier model (cheap + fast)
-CONVERSATION_MEMORY_TURNS=6       # turns kept per session
-CONVERSATION_MAX_SESSIONS=1000    # max sessions in memory
-```
-
-The `route_type` field in every response shows which path was taken:
-```json
-{"answer": "...", "route_type": "small_talk", "latency_ms": 145}
-{"answer": "...", "route_type": "summarization", "latency_ms": 490}
-{"answer": "...", "route_type": "deep_rag", "latency_ms": 1380}
-```
-
-## Semantic caching
-
-Every query is checked against the Redis cache **before** intent classification.
+`POST /query` — full answer once ready.
 
 ```
-User query
-    │
-    ▼
-embed(query)  ← text-embedding-3-small, ~100ms
-    │
-    ▼
-cosine_similarity(query_vec, all_cached_vecs[role][dept])
-    │
-    ├──► sim ≥ 0.92  →  return cached answer   (~100ms total, $0 LLM cost)
-    │
-    └──► sim < 0.92  →  run full pipeline  →  write result to cache
-```
-
-**RBAC-aware namespacing** — cache is partitioned by `(user.role, dept_filter)`.
-An HR user's answer to a confidential question is never served to an engineering
-user through the cache. This means two users with different roles always get
-answers generated for their own permission set.
-
-**What gets cached:** `deep_rag` and `summarization` results only.
-`small_talk` is never cached — it's conversational, session-specific, and cheap.
-
-**Cache invalidation:**
-- Time-based: every entry expires after `SEMANTIC_CACHE_TTL_SECONDS` (default 24h).
-- Event-driven: set `INVALIDATE_CACHE_ON_INGEST=true` to flush on every document update.
-- Manual: `DELETE /cache` (admin) or `DELETE /cache/{role}` (scoped).
-
-Configure in `.env`:
-```bash
-SEMANTIC_CACHE_ENABLED=true
-SEMANTIC_CACHE_SIMILARITY_THRESHOLD=0.92  # tune: 0.85=aggressive, 0.99=exact-only
-SEMANTIC_CACHE_TTL_SECONDS=86400          # 24 hours
-SEMANTIC_CACHE_MAX_ENTRIES=10000          # LRU eviction above this
-INVALIDATE_CACHE_ON_INGEST=false
-```
-
----
-
-## Agentic routing
-
-Every query is classified by a single `gpt-4o-mini` call before anything else runs.
-
-```
-User query
-    │
-    ▼
-classify_intent()  ← gpt-4o-mini, structured JSON, ~100ms
-    │
-    ├──► small_talk     → direct LLM reply, zero retrieval     (~150ms total)
-    │                     e.g. "hi", "what can you do?", "thanks"
-    │
-    ├──► summarization  → Qdrant scroll by doc_id + LLM        (~500ms total)
-    │                     e.g. "summarize the leave policy"
-    │                     Bypasses vector search entirely — fetches
-    │                     ALL chunks for the document in one scroll.
-    │
-    └──► deep_rag       → full 4-layer pipeline                (~1500ms total)
-                          Hybrid search → AutoMerging →
-                          Cohere Rerank → GPT-4o
-```
-
-**Why a classifier LLM call instead of keyword rules?**
-Keyword rules break on edge cases: "summarize how the expense policy works"
-should be `deep_rag` (asking *how*, not asking for a full-doc summary).
-A cheap LLM classifier handles these correctly. The structured JSON output also
-extracts the `target_doc` filename for summarisation in the same call — no
-second round-trip needed.
-
-**Conversation memory** is maintained per session (LRU store, last 6 turns).
-`small_talk` and `summarization` routes receive full history so follow-up
-questions resolve correctly. `deep_rag` is intentionally stateless — injecting
-prior turns into the vector query degrades retrieval precision.
-
-Configure in `.env`:
-```bash
-ROUTER_MODEL=gpt-4o-mini          # intent classifier model
-CONVERSATION_MEMORY_TURNS=6       # turns kept per session
-CONVERSATION_MAX_SESSIONS=1000    # max concurrent sessions
-```
-
----
-
-## Multimodal document processing
-
-Tables and images are processed during ingestion — not at query time.
-
-```
-Document ingestion pipeline:
-  load (LlamaParse)
-       │
-       ├── Tables detected (markdown regex)
-       │       └── GPT-4o-mini summary → TextNode(content_type="table")
-       │
-       ├── Images extracted (LlamaParse JSON mode)
-       │       └── GPT-4o-mini vision description → TextNode(content_type="image")
-       │
-       └── Cleaned text (tables stripped) → hierarchical chunking → text nodes
-                                   ↓
-                All nodes merged → Qdrant (one collection, one search)
-```
-
-**Why summarise instead of embedding raw markdown?**
-Raw table markdown (`| 12 | 18 | 9 |`) produces a weak embedding. A summary like
-"Q1 revenue by region: North America $1.2M, EMEA $0.8M, with North America growing
-15% QoQ" retrieves correctly when a user asks "which region grew fastest in Q1?"
-
-Configure in `.env`:
-```bash
-ENABLE_MULTIMODAL=true       # false skips processing (saves API cost during dev)
-VLM_MODEL=gpt-4o-mini        # gpt-4o for higher quality
-MULTIMODAL_MAX_IMAGE_MB=4.0  # skip images larger than this
-```
-
----
-
-## API Reference
-
-### `POST /query`
-Synchronous endpoint — returns when the full answer is ready.
-
-```bash
 curl -X POST http://localhost:8000/query \
+  -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{"question": "What is the parental leave policy?", "filters": {"department": "hr"}}'
+  -d '{"query": "What is the parental leave policy?"}'
 ```
 
-Response:
-```json
-{
-  "answer": "Primary caregivers receive 16 weeks of fully paid parental leave...",
-  "sources": [
-    {"source": "leave_policy.md", "department": "hr", "score": 0.91, "text_snippet": "..."}
-  ],
-  "latency_ms": 1380.5,
-  "route_type": "deep_rag"
-}
-```
+`POST /query/stream` — streams tokens over SSE, then a sources event.
 
-### `POST /query/stream`
-Streaming endpoint — yields SSE tokens, then a sources event.
+`POST /ingest` — triggers re-ingestion in the background.
 
-```bash
-curl -N -X POST http://localhost:8000/query/stream \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Expense report process?"}'
-```
+`GET /health` — liveness/readiness check (no auth), used as the container health check.
 
-### `POST /ingest`
-Trigger re-ingestion (runs in background).
-
-```bash
-curl -X POST http://localhost:8000/ingest -d '{"force_rebuild": false}'
-```
-
-### `GET /docs-list`
-List all indexed documents.
-
-### `GET /health`
-Liveness + readiness check.
-
----
+Get a token from `POST /token` (or `/auth/token`) with a demo username and the password `secret`.
 
 ## Configuration
 
-All settings are in `.env`. Key options:
+Everything is set in `.env`. The main options:
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
-| `LLM_MODEL` | `gpt-4o` | LLM for answer generation |
-| `TOP_K_RETRIEVAL` | `10` | Candidates fetched from Qdrant before reranking |
-| `TOP_N_RERANK` | `3` | Chunks kept after Cohere reranking |
-| `HYBRID_ALPHA` | `0.5` | BM25 vs vector blend (0=BM25, 1=vector) |
-| `CHUNK_SIZES` | `2048,512,128` | Hierarchical chunk sizes in tokens |
+| `LLM_MODEL` | `gpt-4o` | model used for answer generation |
+| `TOP_K_RETRIEVAL` | `10` | candidates fetched before reranking |
+| `TOP_N_RERANK` | `3` | chunks kept after reranking |
+| `HYBRID_ALPHA` | `0.5` | BM25 vs vector blend (0 = BM25, 1 = vector) |
+| `CHUNK_SIZES` | `2048,512,128` | hierarchical chunk sizes in tokens |
+| `SEMANTIC_CACHE_ENABLED` | `true` | Redis semantic cache; set to `false` if you are not running Redis |
 
----
+## Known limitations
 
-## Licence
+- The container re-ingests documents on startup so the Qdrant collection and the in-memory docstore are always built together with matching IDs. This is fine for a demo but re-embeds on every deploy; separating ingestion from serving would be the next step.
+- The deployed version runs dense retrieval quality with hybrid enabled; the semantic cache is off in the cloud to avoid a managed Redis instance.
+- Access is over the task's public IP, which changes on restart. A load balancer would give a stable URL.
+
+## License
 
 MIT
