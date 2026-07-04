@@ -11,6 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download the SPLADE sparse model so it's baked into the image
+# (avoids the slow/hanging runtime download when the container starts)
+RUN python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding('prithvida/Splade_PP_en_v1')"
+
 # Copy application code
 COPY . .
 

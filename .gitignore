@@ -53,3 +53,4 @@ logs/
 .coverage
 htmlcov/
 rag/
+task-definition.json

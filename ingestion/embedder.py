@@ -74,8 +74,8 @@ def get_qdrant_client() -> QdrantClient:
 def ensure_collection(client: QdrantClient, collection_name: str) -> None:
     existing = {c.name for c in client.get_collections().collections}
     if collection_name in existing:
-        logger.info(f"Qdrant collection '{collection_name}' already exists — skipping creation")
-        return
+        logger.info(f"Qdrant collection '{collection_name}' exists — deleting to rebuild in sync with docstore")
+        client.delete_collection(collection_name)
 
     dim_map = {
         "text-embedding-3-small": 1536,
