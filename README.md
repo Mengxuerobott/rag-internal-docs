@@ -23,6 +23,7 @@ At query time, the request is authenticated (JWT) and routed by intent. A knowle
 - UI: Streamlit
 - Auth: JWT with role-based access control
 - Packaging: Docker; deployed on AWS ECS Fargate with the image in Amazon ECR
+- CI/CD: GitHub Actions (OIDC auth), build and push to ECR, deploy to Fargate on push to `main`
 
 ## Evaluation
 
@@ -58,6 +59,12 @@ The API is packaged as a container and runs on Fargate. A few notes that matter 
 - Secrets (API keys, Qdrant URL) are passed as environment variables in the ECS task definition, not baked into the image. `.env` and the task definition file are gitignored.
 - Hybrid mode loads the SPLADE model in addition to building the index, so the task needs more memory than a minimal container; 4 GB was enough, 2 GB was not.
 - The semantic cache (Redis) is enabled locally but turned off in the deployed version to avoid running a managed Redis instance. The caching code is still in the repo.
+
+### CI/CD
+
+Pushing to `main` triggers a GitHub Actions workflow (`.github/workflows/deploy.yml`) that builds the image for `linux/amd64`, pushes it to ECR (tagged both `latest` and the commit SHA), and triggers a new Fargate deployment.
+
+Authentication to AWS uses OIDC rather than a stored access key: GitHub and AWS establish a trust relationship, and each workflow run assumes an IAM role to get short-lived credentials. The role's trust policy is scoped to this repository only, so no long-lived AWS credentials are stored in GitHub. Tagging each image with its commit SHA means every deployed image traces back to an exact commit.
 
 ## Project layout
 
