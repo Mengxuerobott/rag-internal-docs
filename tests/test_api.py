@@ -53,12 +53,36 @@ def client():
     mock_engine = MagicMock()
     mock_engine.query.return_value = _make_mock_response()
 
+    # These tests assert on the real /query response shape — sources, latency,
+    # validation — so route_query is deliberately NOT mocked. Only the two
+    # things that would reach the network are replaced: the query engine, and
+    # the intent classifier (a live gpt-4o-mini call). The classifier is
+    # pinned to DEEP_RAG so requests take the retrieval path under test.
+    #
+    # The semantic cache is forced off: with it enabled a second identical
+    # question would be served from cache and never touch the engine, making
+    # these assertions depend on test execution order.
+    from retrieval.router import Intent
+
     with patch("api.main.get_or_build_index", return_value=MagicMock()), \
-         patch("api.main.get_query_engine", return_value=mock_engine), \
-         patch("retrieval.query_engine.get_query_engine", return_value=mock_engine):
+         patch("api.main.set_index"), \
+         patch("api.main.get_index", return_value=MagicMock()), \
+         patch("api.main._build_deep_rag_engine", return_value=mock_engine), \
+         patch("retrieval.router.classify_intent",
+               return_value=(Intent.DEEP_RAG, 1.0, None)), \
+         patch("retrieval.router.get_semantic_cache", return_value=None):
 
         from api.main import app
         with TestClient(app, raise_server_exceptions=True) as c:
+            # Every endpoint these tests touch requires a Bearer JWT. Attaching
+            # the token to the client's default headers keeps the individual
+            # tests focused on response shape rather than repeating auth setup.
+            # "admin" because TestIngest exercises the admin-only /ingest route.
+            token = c.post(
+                "/auth/token",
+                data={"username": "admin", "password": "secret"},
+            ).json()["access_token"]
+            c.headers.update({"Authorization": f"Bearer {token}"})
             yield c
 
 
@@ -108,9 +132,13 @@ class TestQuery:
             assert "score" in src
             assert "text_snippet" in src
 
-    def test_query_latency_is_positive(self, client):
+    def test_query_latency_is_reported(self, client):
+        # Not `> 0`: with the engine and classifier mocked out the whole
+        # request finishes in well under a tenth of a millisecond, and the
+        # handler rounds to 1dp, so a genuine pass would round to 0.0. What
+        # this can meaningfully assert is that the field is present and sane.
         r = client.post("/query", json={"question": "Expense report process?"})
-        assert r.json()["latency_ms"] > 0
+        assert r.json()["latency_ms"] >= 0
 
     def test_query_rejects_empty_question(self, client):
         r = client.post("/query", json={"question": ""})

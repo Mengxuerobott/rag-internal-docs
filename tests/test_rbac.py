@@ -111,7 +111,16 @@ class TestCanAccess:
         assert can_access("management", ["hr", "management", "admin"]) is True
 
     def test_management_cannot_access_engineering_chunk(self):
-        assert can_access("management", ["employee", "engineering"]) is False
+        # An engineering-ONLY chunk. management expands to
+        # {employee, hr, finance, management}, which does not intersect.
+        assert can_access("management", ["engineering"]) is False
+
+    def test_management_can_access_engineering_chunk_shared_with_employees(self):
+        # Counterpart to the test above, and the reason it has to say
+        # ["engineering"] rather than ["employee", "engineering"]: a chunk
+        # tagged employee-readable is readable by every role that inherits
+        # "employee", management included. Access here is correct, not a leak.
+        assert can_access("management", ["employee", "engineering"]) is True
 
     def test_admin_can_access_any_chunk(self):
         for folder, roles in FOLDER_PERMISSIONS.items():
@@ -182,7 +191,7 @@ def api_client():
          patch("api.main.set_index"), \
          patch("api.main.get_index", return_value=MagicMock()), \
          patch("api.main.build_query_engine_for_user", return_value=mock_engine), \
-         patch("api.main._build_engine_for", return_value=mock_engine):
+         patch("api.main._build_deep_rag_engine", return_value=mock_engine):
         from api.main import app
         with TestClient(app) as c:
             yield c
