@@ -159,7 +159,7 @@ def webhook_client():
          patch("api.main.get_index", return_value=MagicMock()), \
          patch("webhooks.router._get_redis_pool", return_value=mock_redis_pool), \
          patch("api.main.build_query_engine_for_user", return_value=MagicMock()), \
-         patch("api.main._build_engine_for", return_value=MagicMock()):
+         patch("api.main._build_deep_rag_engine", return_value=MagicMock()):
         from api.main import app
         with TestClient(app) as c:
             yield c
