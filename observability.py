@@ -268,6 +268,58 @@ def update_current_trace(**attributes: Any) -> None:
         logger.debug(f"update_current_trace failed ({e}) — ignored.")
 
 
+def get_current_trace_id() -> Optional[str]:
+    """
+    ID of the trace currently in scope, or None.
+
+    Used by the RAGAS evaluator to remember which trace produced each answer,
+    so the scores computed afterwards can be attached back to it.
+    """
+    if not _active:
+        return None
+
+    try:
+        from langfuse.decorators import langfuse_context
+
+        return langfuse_context.get_current_trace_id()
+    except Exception as e:
+        logger.debug(f"get_current_trace_id failed ({e}) — ignored.")
+        return None
+
+
+def score_trace(
+    trace_id: str,
+    name: str,
+    value: float,
+    comment: Optional[str] = None,
+) -> None:
+    """
+    Attach an evaluation score to a trace after the fact.
+
+    This is what connects RAGAS to tracing: faithfulness, answer_relevancy,
+    context_precision and context_recall land on the very trace whose spans
+    show the retrieval and synthesis that produced the answer. A low
+    faithfulness score becomes clickable — you can see whether the reranker
+    dropped the chunk that mattered, or the synthesizer ignored it.
+
+    Silently does nothing when tracing is off. Never raises.
+    """
+    if not _active or not trace_id:
+        return
+
+    try:
+        from langfuse import Langfuse
+
+        Langfuse().score(
+            trace_id=trace_id,
+            name=name,
+            value=value,
+            comment=comment,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to attach score {name!r} to trace {trace_id} ({e}).")
+
+
 def update_current_observation(**attributes: Any) -> None:
     """
     Attach metadata to the current span (as opposed to the whole trace).

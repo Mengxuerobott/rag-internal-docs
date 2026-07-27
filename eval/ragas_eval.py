@@ -44,6 +44,16 @@ from ragas.metrics import (
 from rich.console import Console
 from rich.table import Table
 
+from observability import (
+    get_current_trace_id,
+    init_tracing,
+    is_tracing_active,
+    score_trace,
+    shutdown_tracing,
+    traced,
+    update_current_observation,
+)
+
 
 # ── Test dataset ──────────────────────────────────────────────────────────────
 # In production you'd load this from a JSON / CSV file.
@@ -93,6 +103,31 @@ DEFAULT_TEST_CASES = [
 ]
 
 
+# ── Single-case runner ────────────────────────────────────────────────────────
+@traced(name="ragas_eval_case")
+def _answer_one_case(engine, question: str) -> tuple[str, list[str], Optional[str]]:
+    """
+    Run one test case through the pipeline inside its own trace.
+
+    The trace ID is captured here, while the span is still in scope, so the
+    RAGAS scores computed later can be attached back to the exact trace whose
+    retrieval and synthesis produced this answer.
+
+    Returns (answer, contexts, trace_id). trace_id is None when tracing is off.
+    """
+    response = engine.query(question)
+    answer = str(response)
+    contexts = [node.node.text for node in response.source_nodes]
+
+    update_current_observation(
+        input=question,
+        output=answer,
+        n_contexts=len(contexts),
+    )
+
+    return answer, contexts, get_current_trace_id()
+
+
 # ── Core evaluation function ──────────────────────────────────────────────────
 def run_evaluation(
     test_cases: list[dict] | None = None,
@@ -115,6 +150,11 @@ def run_evaluation(
     cases = test_cases or DEFAULT_TEST_CASES
     logger.info(f"Running RAGAS evaluation on {len(cases)} test cases…")
 
+    # This is a CLI entry point, so it doesn't go through the FastAPI lifespan
+    # that normally installs tracing. Set it up here so eval runs produce the
+    # same full-pipeline traces a live request would. No-op unless enabled.
+    init_tracing()
+
     # Load the query engine
     index = get_or_build_index()
     engine = get_query_engine(index)
@@ -129,9 +169,7 @@ def run_evaluation(
 
         start = time.perf_counter()
         try:
-            response = engine.query(question)
-            answer = str(response)
-            contexts = [node.node.text for node in response.source_nodes]
+            answer, contexts, trace_id = _answer_one_case(engine, question)
             latency = time.perf_counter() - start
 
             eval_rows.append({
@@ -140,6 +178,7 @@ def run_evaluation(
                 "contexts":     contexts,
                 "ground_truth": ground_truth,
                 "latency_s":    round(latency, 2),
+                "trace_id":     trace_id,
             })
 
             logger.debug(f"    → answered in {latency:.1f}s, {len(contexts)} context chunks")
@@ -152,6 +191,7 @@ def run_evaluation(
                 "contexts":     [],
                 "ground_truth": ground_truth,
                 "latency_s":    0.0,
+                "trace_id":     None,
             })
 
     # ── Build RAGAS dataset ───────────────────────────────────────────────────
@@ -190,6 +230,9 @@ def run_evaluation(
         "per_question":      eval_rows,
     }
 
+    # ── Attach scores back to their traces ────────────────────────────────────
+    _attach_scores_to_traces(scores, eval_rows)
+
     # ── Pretty-print results ──────────────────────────────────────────────────
     _print_results(results)
 
@@ -201,6 +244,64 @@ def run_evaluation(
         logger.info(f"Results saved to {output_path}")
 
     return results
+
+
+_RAGAS_METRICS = (
+    "faithfulness",
+    "answer_relevancy",
+    "context_precision",
+    "context_recall",
+)
+
+
+def _attach_scores_to_traces(scores, eval_rows: list[dict]) -> None:
+    """
+    Push each case's RAGAS scores onto the trace that produced its answer.
+
+    This is the payoff of tracing the eval run: instead of a bare number in a
+    JSON file, a low faithfulness score becomes a clickable trace showing the
+    retrieved chunks, what the reranker kept or dropped, and the exact prompt
+    the synthesizer built. Answers "why is this score bad?", not just "it is".
+
+    No-op when tracing is off. Never raises — a scoring failure must not lose
+    an eval run that has already spent real API budget.
+    """
+    if not is_tracing_active():
+        return
+
+    # RAGAS returns per-question score lists alongside the aggregates; fall
+    # back to skipping rather than guessing if the shape isn't what we expect.
+    try:
+        per_question = scores.to_pandas()
+    except Exception as e:
+        logger.warning(f"Could not read per-question RAGAS scores ({e}) — traces left unscored.")
+        return
+
+    attached = 0
+    for i, row in enumerate(eval_rows):
+        trace_id = row.get("trace_id")
+        if not trace_id or i >= len(per_question):
+            continue
+
+        for metric in _RAGAS_METRICS:
+            if metric not in per_question.columns:
+                continue
+
+            value = per_question[metric].iloc[i]
+            # RAGAS emits NaN when a metric can't be computed for a case.
+            if value is None or value != value:
+                continue
+
+            score_trace(
+                trace_id=trace_id,
+                name=metric,
+                value=float(value),
+                comment=f"RAGAS · {row['question'][:100]}",
+            )
+        attached += 1
+
+    logger.info(f"Attached RAGAS scores to {attached}/{len(eval_rows)} traces.")
+    shutdown_tracing()
 
 
 def _print_results(results: dict) -> None:
