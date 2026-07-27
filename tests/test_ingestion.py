@@ -55,16 +55,27 @@ def sample_docs_dir(tmp_path_factory) -> Path:
 
 @pytest.fixture(scope="module")
 def loaded_documents(sample_docs_dir):
-    """Load documents from the temp directory."""
+    """Load documents from the temp directory.
+
+    load_documents returns (documents, multimodal_nodes). Only the documents
+    are of interest here; multimodal extraction is covered by test_multimodal.
+    Returning the raw tuple made every consumer below see a 2-element tuple
+    instead of a document list.
+    """
     from ingestion.loader import load_documents
-    return load_documents(str(sample_docs_dir))
+    documents, _multimodal_nodes = load_documents(str(sample_docs_dir))
+    return documents
 
 
 @pytest.fixture(scope="module")
 def hierarchical_nodes(loaded_documents):
     """Build hierarchical nodes from loaded documents."""
     from ingestion.chunker import build_hierarchical_nodes
-    return build_hierarchical_nodes(loaded_documents, chunk_sizes=[512, 128, 64])
+    # Smaller than the [2048, 512, 128] production default so the test corpus
+    # still produces a multi-level hierarchy, but the leaf size must stay above
+    # the per-node metadata length (~76 chars here) or LlamaIndex raises
+    # "Metadata length is longer than chunk size". 64 was below it.
+    return build_hierarchical_nodes(loaded_documents, chunk_sizes=[512, 256, 128])
 
 
 # ── Loader tests ──────────────────────────────────────────────────────────────
@@ -113,7 +124,8 @@ class TestLoader:
         """load_single_file should return at least one Document."""
         from ingestion.loader import load_single_file
         md_file = str(list(sample_docs_dir.rglob("*.md"))[0])
-        docs = load_single_file(md_file)
+        # Returns the same (documents, multimodal_nodes) tuple as load_documents.
+        docs, _multimodal_nodes = load_single_file(md_file)
         assert len(docs) >= 1
         assert docs[0].text.strip()
 
