@@ -45,6 +45,7 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
 from auth.jwt_handler import CurrentUser
 from auth.rbac import expand_roles
 from config import settings
+from observability import traced, update_current_observation
 
 
 # ── Shared types ──────────────────────────────────────────────────────────────
@@ -114,6 +115,7 @@ class SmallTalkHandler:
     triggered a full vector search + reranker now costs one gpt-4o-mini call.
     """
 
+    @traced(name="small_talk_handler", as_type="generation")
     def handle(self, ctx: RouteContext) -> RouteResult:
         import time
         start = time.perf_counter()
@@ -132,6 +134,18 @@ class SmallTalkHandler:
 
         answer = response.choices[0].message.content.strip()
         latency = (time.perf_counter() - start) * 1000
+
+        usage = getattr(response, "usage", None)
+        update_current_observation(
+            model=settings.ROUTER_MODEL,
+            usage={
+                "input":  getattr(usage, "prompt_tokens", None),
+                "output": getattr(usage, "completion_tokens", None),
+                "total":  getattr(usage, "total_tokens", None),
+            } if usage else None,
+            history_turns=len(ctx.history),
+            latency_ms=round(latency, 1),
+        )
 
         logger.info(
             f"SmallTalk route: user={ctx.user.username!r} "
@@ -187,6 +201,7 @@ class SummarizationHandler:
     the reranker entirely.
     """
 
+    @traced(name="summarization_handler", as_type="generation")
     def handle(self, ctx: RouteContext) -> RouteResult:
         import time
         start = time.perf_counter()
@@ -198,6 +213,14 @@ class SummarizationHandler:
             logger.warning(
                 f"Summarization: no chunks found for target_doc={ctx.target_doc!r} "
                 f"user={ctx.user.username!r}"
+            )
+            # A miss here usually means the router guessed a filename that
+            # doesn't exist — worth surfacing on the trace, not just in logs.
+            update_current_observation(
+                level="WARNING",
+                status_message=f"no chunks matched target_doc={ctx.target_doc!r}",
+                target_doc=ctx.target_doc,
+                chunks_found=0,
             )
             return RouteResult(
                 answer=(
@@ -239,6 +262,21 @@ class SummarizationHandler:
         answer = response.choices[0].message.content.strip()
         latency = (time.perf_counter() - start) * 1000
 
+        usage = getattr(response, "usage", None)
+        update_current_observation(
+            model=settings.LLM_MODEL,
+            usage={
+                "input":  getattr(usage, "prompt_tokens", None),
+                "output": getattr(usage, "completion_tokens", None),
+                "total":  getattr(usage, "total_tokens", None),
+            } if usage else None,
+            target_doc=ctx.target_doc,
+            resolved_doc=doc_name,
+            chunks_found=len(chunks),
+            combined_chars=len(combined_text),
+            latency_ms=round(latency, 1),
+        )
+
         logger.info(
             f"Summarization route: doc={doc_name!r} chunks={len(chunks)} "
             f"user={ctx.user.username!r} latency={latency:.0f}ms"
@@ -260,12 +298,16 @@ class SummarizationHandler:
             latency_ms=round(latency, 1),
         )
 
+    @traced(name="qdrant_scroll_document")
     def _fetch_document_chunks(
         self,
         ctx: RouteContext,
     ) -> tuple[list[dict], str]:
         """
         Scroll Qdrant for all chunks matching target_doc, filtered by RBAC.
+
+        Traced manually — this is a direct Qdrant call that bypasses
+        LlamaIndex entirely, so the global handler never sees it.
 
         Returns (chunks, resolved_doc_name) where chunks is a list of
         {text, department, allowed_roles, page_num} dicts.
@@ -339,12 +381,27 @@ class SummarizationHandler:
                 chunks.sort(key=lambda c: c.get("page_num") or 0)
 
                 resolved_name = results[0].payload.get("source", target)
+                update_current_observation(
+                    target_doc=target,
+                    resolved_doc=resolved_name,
+                    chunks_found=len(chunks),
+                    # Which of the candidate filters actually matched — useful
+                    # for spotting a router that keeps guessing bad filenames.
+                    matched_filter_index=filters_to_try.index(qdrant_filter),
+                    accessible_roles=accessible_roles,
+                )
                 logger.debug(
                     f"Summarization: found {len(chunks)} chunks for "
                     f"target={target!r} resolved={resolved_name!r}"
                 )
                 return chunks, resolved_name
 
+        update_current_observation(
+            target_doc=target,
+            chunks_found=0,
+            filters_tried=len(filters_to_try),
+            accessible_roles=accessible_roles,
+        )
         return [], target
 
 
@@ -360,6 +417,7 @@ class DeepRagHandler:
     the router determines the question needs precise document retrieval.
     """
 
+    @traced(name="deep_rag_handler")
     def handle(self, ctx: RouteContext) -> RouteResult:
         import time
         start = time.perf_counter()
@@ -408,6 +466,17 @@ class DeepRagHandler:
             })
 
         sources.sort(key=lambda s: s["score"], reverse=True)
+
+        # The retrieve/rerank/synthesize detail underneath this span comes from
+        # LlamaIndex automatically; this just summarises the outcome so the
+        # route is readable without expanding every child span.
+        update_current_observation(
+            n_source_nodes=len(getattr(response, "source_nodes", [])),
+            n_unique_sources=len(sources),
+            top_score=sources[0]["score"] if sources else None,
+            sources=[s["source"] for s in sources],
+            latency_ms=round(latency, 1),
+        )
 
         logger.info(
             f"DeepRAG route: user={ctx.user.username!r} "
