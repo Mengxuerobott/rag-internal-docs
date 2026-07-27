@@ -187,3 +187,27 @@ class TestValidation:
     def test_missing_question_rejected(self, client):
         r = client.post("/query", json={})
         assert r.status_code == 422
+
+
+# ── CORS configuration ────────────────────────────────────────────────────────
+class TestCorsOrigins:
+    """
+    allow_origins was "*" on an authenticated API. Bearer tokens make that less
+    severe than a cookie-based API, but there is no reason for it to be open.
+    """
+
+    def test_default_is_not_wildcard(self):
+        from config import settings
+        assert "*" not in settings.CORS_ALLOWED_ORIGINS
+
+    def test_default_is_the_local_ui(self):
+        from config import settings
+        assert settings.CORS_ALLOWED_ORIGINS == ["http://localhost:8501"]
+
+    def test_app_uses_the_configured_origins(self):
+        """Guards against the middleware being re-hardcoded to "*"."""
+        from api.main import app
+        from config import settings
+        cors = [m for m in app.user_middleware if "CORS" in str(m.cls)]
+        assert cors, "CORS middleware not installed"
+        assert cors[0].kwargs["allow_origins"] == settings.CORS_ALLOWED_ORIGINS

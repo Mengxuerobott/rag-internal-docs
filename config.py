@@ -284,9 +284,39 @@ class Settings:
     API_HOST: str = os.getenv("API_HOST", "0.0.0.0")
     API_PORT: int = int(os.getenv("API_PORT", "8000"))
 
+    # Browser origins allowed to call this API. Comma-separated.
+    #
+    # This was "*", which on an authenticated API lets any page a user visits
+    # call it with their token. Bearer tokens make that less severe than a
+    # cookie-based API (no ambient authority), but there is no reason for it to
+    # be open. Defaults to the local Streamlit UI; set the deployed UI's origin
+    # in the task definition.
+    CORS_ALLOWED_ORIGINS: list[str] = [
+        o.strip()
+        for o in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:8501").split(",")
+        if o.strip()
+    ]
+
     # ── Directories ───────────────────────────────────────────────────────────
     DOCS_DIR: str = os.getenv("DOCS_DIR", "data/sample_docs")
     INDEX_PERSIST_DIR: str = os.getenv("INDEX_PERSIST_DIR", "data/index_store")
+
+    # ── Durable index storage (optional) ──────────────────────────────────────
+    # INDEX_PERSIST_DIR holds the docstore, which is the only place parent nodes
+    # live — Qdrant stores just the embedded leaves. On Fargate that directory
+    # dies with the task, so every deploy re-runs ingestion and re-embeds the
+    # whole corpus purely to rebuild it.
+    #
+    # Set INDEX_S3_BUCKET to mirror it to S3 instead: restored at startup,
+    # uploaded after each ingestion. Leave blank to keep the previous behaviour
+    # (local disk only, rebuild when empty), which is what local development and
+    # the test suite use.
+    INDEX_S3_BUCKET: str = os.getenv("INDEX_S3_BUCKET", "")
+    INDEX_S3_PREFIX: str = os.getenv("INDEX_S3_PREFIX", "index_store")
+
+    # Region for the S3 client. Falls back to boto3's own resolution (env,
+    # profile, or instance metadata) when unset.
+    AWS_REGION: str = os.getenv("AWS_REGION", "")
 
 
 def _validate_security_settings(s: Settings) -> None:
