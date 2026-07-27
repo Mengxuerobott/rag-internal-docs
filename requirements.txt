@@ -29,6 +29,16 @@ ragas==0.2.6
 datasets==3.1.0
 
 # Observability
+# Langfuse 2.x is the line that integrates with llama-index-core 0.10.x via
+# set_global_handler("langfuse"). Do NOT bump either of these: langfuse 3.x and
+# llama-index-callbacks-langfuse 0.2.0+ target the new instrumentation API and
+# require llama-index-core >= 0.11, which would drag core from 0.10.68 to 0.14.
+langfuse==2.60.10
+llama-index-callbacks-langfuse==0.1.6
+# DEPRECATED: not wired into this project. LangSmith's automatic tracing hooks
+# LangChain runnables, and this codebase is LlamaIndex-only, so
+# LANGCHAIN_TRACING_V2 captures nothing here. Kept because ragas pulls it in
+# transitively — removing it would break the eval dependency chain.
 langsmith==0.1.147
 
 # Utilities

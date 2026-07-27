@@ -30,6 +30,26 @@ class Settings:
     QDRANT_COLLECTION_NAME: str = os.getenv("QDRANT_COLLECTION_NAME", "company_docs")
 
     # ── Observability ─────────────────────────────────────────────────────────
+    # Langfuse traces the full LlamaIndex pipeline automatically via
+    # set_global_handler("langfuse") — see observability.py.
+    #
+    # Master switch. When false (the default) tracing is a no-op and the
+    # request path is byte-for-byte what it was before tracing was added.
+    # Tracing also stays off if either key below is blank.
+    LANGFUSE_ENABLED: bool = os.getenv("LANGFUSE_ENABLED", "false").lower() == "true"
+
+    # Credentials from your Langfuse project settings. Keep these in .env only.
+    LANGFUSE_PUBLIC_KEY: str = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+    LANGFUSE_SECRET_KEY: str = os.getenv("LANGFUSE_SECRET_KEY", "")
+
+    # Langfuse Cloud EU (default), US (https://us.cloud.langfuse.com),
+    # or your own self-hosted URL.
+    LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+
+    # DEPRECATED — LangSmith is not wired into this project and never was.
+    # Its automatic tracing instruments LangChain runnables; this codebase is
+    # LlamaIndex-only, so LANGCHAIN_TRACING_V2 captures nothing. Kept so that
+    # existing .env files don't break. Use the LANGFUSE_* settings instead.
     LANGCHAIN_API_KEY: str = os.getenv("LANGCHAIN_API_KEY", "")
     LANGCHAIN_TRACING_V2: str = os.getenv("LANGCHAIN_TRACING_V2", "false")
     LANGCHAIN_PROJECT: str = os.getenv("LANGCHAIN_PROJECT", "rag-internal-docs")
