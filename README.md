@@ -225,7 +225,11 @@ One leftover worth knowing: `requirements.txt` still pins `langsmith` and `confi
 
 ## Tests
 
+The test runner lives in `requirements-dev.txt`, separate from the runtime
+dependencies so it does not ship into the deployed image:
+
 ```
+pip install -r requirements.txt -r requirements-dev.txt
 pytest tests/ -v
 pytest tests/ --cov=. --cov-report=html
 ```
