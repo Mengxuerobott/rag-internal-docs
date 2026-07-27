@@ -29,7 +29,9 @@ Endpoints:
   POST /webhooks/sharepoint — SharePoint event webhook
   POST /webhooks/gdrive     — Google Drive event webhook
 
-Demo credentials (password "secret" for all):
+Demo credentials — all seven accounts share the password set in
+DEMO_USER_PASSWORD ("secret" locally; the app refuses to start with that
+default unless ALLOW_INSECURE_AUTH=true):
     alice=hr  bob=engineering  carol=finance  dave=management
     eve=employee  frank=legal  admin=admin
 """
@@ -84,7 +86,7 @@ async def lifespan(app: FastAPI):
         elapsed = time.perf_counter() - start
         logger.info(f"Index ready in {elapsed:.1f}s")
     except Exception as e:
-        logger.error(f"Failed to load index: {e}")
+        logger.exception(f"Failed to load index: {e}")
         raise
     yield
     # Langfuse batches spans on a background thread; flush so the tail of the
@@ -250,7 +252,7 @@ async def query(
     try:
         query_engine = _build_deep_rag_engine(user, req.department_filter)
     except Exception as e:
-        logger.error(f"Failed to build query engine: {e}")
+        logger.exception(f"Failed to build query engine: {e}")
         query_engine = None
 
     try:
@@ -278,7 +280,7 @@ async def query(
         )
 
     except Exception as e:
-        logger.error(f"Query failed for user={user.username}: {e}")
+        logger.exception(f"Query failed for user={user.username}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -313,7 +315,7 @@ async def query_stream(
             ):
                 yield chunk
         except Exception as e:
-            logger.error(f"Streaming query failed: {e}")
+            logger.exception(f"Streaming query failed: {e}")
             yield f"data: [ERROR]{str(e)}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -370,7 +372,7 @@ async def ingest(
             set_index(new_index)
             logger.info("Re-ingestion complete — index singleton updated")
         except Exception as e:
-            logger.error(f"Re-ingestion failed: {e}")
+            logger.exception(f"Re-ingestion failed: {e}")
 
     background_tasks.add_task(_run)
     return {"status": "ingestion started", "force_rebuild": req.force_rebuild}

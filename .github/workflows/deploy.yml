@@ -23,13 +23,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      # 3.11, not 3.12: llama-index-postprocessor-cohere-rerank on the 0.1.x
-      # line — the line compatible with llama-index-core 0.10.x — requires
-      # Python < 3.12.
+      # Must match Dockerfile.api's base image. This was pinned to 3.11 on the
+      # belief that cohere-rerank 0.1.x required Python < 3.12 — that is true of
+      # 0.1.9, which does not exist on PyPI, but not of 0.1.7, which is what is
+      # actually pinned. The effect was a gate validating a runtime production
+      # never uses.
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
