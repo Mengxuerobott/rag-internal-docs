@@ -282,3 +282,40 @@ class TestAuthEndpoints:
     def test_health_requires_no_auth(self, api_client):
         r = api_client.get("/health")
         assert r.status_code == 200
+
+
+# ── Qdrant pre-filter construction ────────────────────────────────────────────
+class TestRbacFilterConstruction:
+    """
+    _build_rbac_filter produces the Qdrant payload pre-filter. The department
+    filter was folded into it when the duplicated engine assembly in
+    api/main.py was removed, and the API-level tests mock the engine builder
+    out, so this is the only thing covering that behaviour.
+    """
+
+    def _f(self, *args):
+        from retrieval.query_engine import _build_rbac_filter
+        return _build_rbac_filter(*args)
+
+    def test_rbac_clause_present_without_department(self):
+        filters = self._f("management").filters
+        assert len(filters) == 1
+        assert filters[0].key == "allowed_roles"
+        assert set(filters[0].value) == set(expand_roles("management"))
+
+    def test_department_is_anded_on_top_of_rbac(self):
+        f = self._f("management", "hr")
+        assert f.condition.value == "and"
+        keys = [x.key for x in f.filters]
+        assert keys == ["allowed_roles", "department"]
+        assert f.filters[1].value == "hr"
+
+    def test_department_never_widens_role_access(self):
+        """The role clause must survive unchanged when a department is added."""
+        without = self._f("hr").filters[0]
+        with_dept = self._f("hr", "engineering").filters[0]
+        assert with_dept.key == without.key
+        assert set(with_dept.value) == set(without.value)
+
+    def test_empty_department_string_adds_no_clause(self):
+        assert len(self._f("hr", "").filters) == 1

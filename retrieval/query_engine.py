@@ -66,7 +66,10 @@ Tone: professional but approachable."""
 
 
 # ── RBAC filter builder ───────────────────────────────────────────────────────
-def _build_rbac_filter(user_role: str) -> MetadataFilters:
+def _build_rbac_filter(
+    user_role: str,
+    department_filter: str | None = None,
+) -> MetadataFilters:
     """
     Build a LlamaIndex MetadataFilters object that Qdrant translates into a
     payload pre-filter.
@@ -87,16 +90,32 @@ def _build_rbac_filter(user_role: str) -> MetadataFilters:
     insecure. Pre-filtering is enforced at the vector database level.
     """
     accessible_roles = expand_roles(user_role)
-    logger.debug(f"RBAC pre-filter: role={user_role!r} -> accessible={accessible_roles}")
+    logger.debug(
+        f"RBAC pre-filter: role={user_role!r} -> accessible={accessible_roles}"
+        + (f" dept={department_filter!r}" if department_filter else "")
+    )
+
+    filters = [
+        MetadataFilter(
+            key="allowed_roles",
+            value=accessible_roles,
+            operator=FilterOperator.IN,   # "allowed_roles contains any of [list]"
+        )
+    ]
+
+    # Optional narrowing to one department. ANDed with the RBAC clause, so it
+    # can only ever restrict the candidate set further — it cannot widen access.
+    if department_filter:
+        filters.append(
+            MetadataFilter(
+                key="department",
+                value=department_filter,
+                operator=FilterOperator.EQ,
+            )
+        )
 
     return MetadataFilters(
-        filters=[
-            MetadataFilter(
-                key="allowed_roles",
-                value=accessible_roles,
-                operator=FilterOperator.IN,   # "allowed_roles contains any of [list]"
-            )
-        ],
+        filters=filters,
         condition=FilterCondition.AND,
     )
 
@@ -105,6 +124,7 @@ def _build_rbac_filter(user_role: str) -> MetadataFilters:
 def build_query_engine_for_user(
     index: VectorStoreIndex,
     user_role: str,
+    department_filter: str | None = None,
 ) -> RetrieverQueryEngine:
     """
     Build a query engine scoped to a specific user's role.
@@ -113,16 +133,19 @@ def build_query_engine_for_user(
     (no re-embedding) but injects a fresh RBAC filter into the retriever.
 
     Args:
-        index:     The VectorStoreIndex singleton loaded at startup.
-        user_role: The role string extracted from the user's JWT
-                   (e.g. "hr", "engineering", "management").
+        index:             The VectorStoreIndex singleton loaded at startup.
+        user_role:         The role string extracted from the user's JWT
+                           (e.g. "hr", "engineering", "management").
+        department_filter: Optional department to narrow the search to. ANDed
+                           with the RBAC clause, so it can only restrict the
+                           candidate set further, never widen it.
 
     Returns:
         A RetrieverQueryEngine that will only surface chunks the user
         is authorised to see.
     """
     storage_context = index.storage_context
-    rbac_filter = _build_rbac_filter(user_role)
+    rbac_filter = _build_rbac_filter(user_role, department_filter)
 
     # ── Layer 1: Hybrid retriever with RBAC pre-filter ────────────────────────
     base_retriever = index.as_retriever(

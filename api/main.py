@@ -180,71 +180,17 @@ def _build_deep_rag_engine(user: CurrentUser, department_filter: Optional[str] =
     Build the per-request RBAC-filtered deep-RAG engine.
     Called only when the router selects the DEEP_RAG path.
     For small_talk and summarization routes this is never called.
+
+    This used to re-implement the whole retriever/postprocessor/synthesizer
+    stack just to add a department filter, which meant any change to retrieval
+    tuning had to be made in two places. The department filter is now a
+    parameter of build_query_engine_for_user, so there is one implementation.
     """
-    from llama_index.core.vector_stores.types import (
-        MetadataFilter, MetadataFilters, FilterOperator, FilterCondition,
+    return build_query_engine_for_user(
+        get_index(),
+        user.role,
+        department_filter=department_filter,
     )
-    from retrieval.query_engine import SYSTEM_PROMPT
-
-    index = get_index()
-
-    if department_filter:
-        accessible_roles = expand_roles(user.role)
-        combined = MetadataFilters(
-            filters=[
-                MetadataFilter(
-                    key="allowed_roles",
-                    value=accessible_roles,
-                    operator=FilterOperator.IN,
-                ),
-                MetadataFilter(
-                    key="department",
-                    value=department_filter,
-                    operator=FilterOperator.EQ,
-                ),
-            ],
-            condition=FilterCondition.AND,
-        )
-        from llama_index.core.query_engine import RetrieverQueryEngine
-        from llama_index.core.retrievers import AutoMergingRetriever
-        from llama_index.core.postprocessor import SimilarityPostprocessor
-        from llama_index.core.response_synthesizers import get_response_synthesizer
-        from llama_index.core import PromptTemplate
-        from llama_index.postprocessor.cohere_rerank import CohereRerank
-
-        base_ret = index.as_retriever(
-            similarity_top_k=settings.TOP_K_RETRIEVAL,
-            vector_store_query_mode="hybrid",
-            alpha=settings.HYBRID_ALPHA,
-            filters=combined,
-        )
-        retriever = AutoMergingRetriever(
-            base_ret, index.storage_context, simple_ratio_thresh=0.5, verbose=False
-        )
-        postprocessors = [SimilarityPostprocessor(similarity_cutoff=0.35)]
-        if settings.COHERE_API_KEY:
-            postprocessors.append(CohereRerank(
-                api_key=settings.COHERE_API_KEY,
-                top_n=settings.TOP_N_RERANK,
-                model="rerank-english-v3.0",
-            ))
-        qa_tmpl = PromptTemplate(
-            f"{SYSTEM_PROMPT}\n\n"
-            "---------------------\nCONTEXT DOCUMENTS:\n{context_str}\n"
-            "---------------------\nUSER QUESTION: {query_str}\n\n"
-            "ANSWER (cite sources using [Source: filename]):"
-        )
-        synthesizer = get_response_synthesizer(
-            response_mode="compact", streaming=True,
-            text_qa_template=qa_tmpl, verbose=False,
-        )
-        return RetrieverQueryEngine(
-            retriever=retriever,
-            node_postprocessors=postprocessors,
-            response_synthesizer=synthesizer,
-        )
-
-    return build_query_engine_for_user(index, user.role)
 
 
 def _sources_to_model(sources: list[dict]) -> list[SourceDoc]:
