@@ -10,6 +10,7 @@ Run:
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -331,10 +332,20 @@ class TestJwtSecretValidation:
     """
 
     def _check(self, secret, allow_insecure):
+        """
+        Validate `secret` in isolation, holding the demo password valid.
+
+        Deliberately not a MagicMock: the validator grew a second credential
+        check, and a mock silently auto-created the new attributes — returning
+        a truthy ALLOW_INSECURE_AUTH that turned every expected refusal into a
+        warning. A plain object fails loudly instead when the shape changes.
+        """
         import config
-        s = MagicMock()
-        s.JWT_SECRET = secret
-        s.ALLOW_INSECURE_JWT_SECRET = allow_insecure
+        s = SimpleNamespace(
+            JWT_SECRET=secret,
+            DEMO_USER_PASSWORD="a-valid-demo-password-not-under-test",
+            ALLOW_INSECURE_AUTH=allow_insecure,
+        )
         config._validate_security_settings(s)
 
     def test_placeholder_secret_refused_by_default(self):
@@ -390,3 +401,62 @@ class TestJwtSecretValidation:
     def test_minimum_length_boundary(self):
         from config import MIN_JWT_SECRET_LENGTH
         self._check("a1b2" * (MIN_JWT_SECRET_LENGTH // 4), allow_insecure=False)
+
+
+# ── Demo account password validation ──────────────────────────────────────────
+class TestDemoPasswordValidation:
+    """
+    Every demo account in auth/jwt_handler.py shares one password, admin
+    included. It used to be hardcoded as "secret", so a strong JWT_SECRET still
+    left a publicly reachable deployment open to simply logging in.
+    """
+
+    def _problem(self, password):
+        from config import _demo_password_problem
+        return _demo_password_problem(password)
+
+    @pytest.mark.parametrize("password", [
+        "secret", "password", "admin", "changeme", "123456", "qwerty",
+    ])
+    def test_common_passwords_refused(self, password):
+        assert "commonly guessed" in (self._problem(password) or "")
+
+    def test_default_is_itself_refused(self):
+        from config import DEFAULT_DEMO_USER_PASSWORD
+        assert self._problem(DEFAULT_DEMO_USER_PASSWORD) is not None
+
+    def test_empty_refused(self):
+        assert "empty" in (self._problem("") or "")
+
+    def test_template_placeholder_refused(self):
+        assert "template value" in (self._problem("REPLACE_ME_PLEASE") or "")
+
+    def test_short_password_refused(self):
+        assert "characters" in (self._problem("aB3$xY") or "")
+
+    def test_length_boundary_accepted(self):
+        from config import MIN_DEMO_PASSWORD_LENGTH
+        assert self._problem("aB3$" * MIN_DEMO_PASSWORD_LENGTH) is None
+
+    def test_generated_password_accepted(self):
+        import secrets
+        assert self._problem(secrets.token_urlsafe(24)) is None
+
+    def test_passphrase_accepted(self):
+        assert self._problem("correct-horse-battery-staple") is None
+
+
+class TestDemoUsersUsePasswordFromConfig:
+    def test_all_demo_accounts_share_the_configured_password(self):
+        """The hash must come from settings, not a hardcoded literal."""
+        from auth.jwt_handler import _DEMO_USERS, verify_password
+        from config import settings
+        for username, record in _DEMO_USERS.items():
+            assert verify_password(settings.DEMO_USER_PASSWORD, record["password"]), (
+                f"{username} does not accept the configured DEMO_USER_PASSWORD"
+            )
+
+    def test_hash_computed_once_not_per_user(self):
+        """bcrypt is slow; seven identical hashes cost ~0.5s per import."""
+        from auth.jwt_handler import _DEMO_USERS
+        assert len({r["password"] for r in _DEMO_USERS.values()}) == 1

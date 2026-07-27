@@ -36,7 +36,7 @@ MIN_JWT_SECRET_LENGTH = 32
 # task definition carried "REPLACE_JWT_SECRET", which is not the .env.example
 # default and so passed silently while being trivially guessable. Placeholders
 # come from many templates, so match the shape, not one literal.
-_JWT_SECRET_PLACEHOLDER_MARKERS = (
+_PLACEHOLDER_MARKERS = (
     "replace",
     "change-me",
     "changeme",
@@ -47,6 +47,20 @@ _JWT_SECRET_PLACEHOLDER_MARKERS = (
     "todo",
     "xxx",
 )
+
+# The demo accounts in auth/jwt_handler.py all share one password, which used
+# to be hardcoded as "secret". A strong JWT_SECRET stops forged tokens but does
+# nothing about someone simply signing in as `admin` on a reachable deployment.
+DEFAULT_DEMO_USER_PASSWORD = "secret"
+
+# Lower bar than a signing key: this is a password a person types, not a key.
+MIN_DEMO_PASSWORD_LENGTH = 12
+
+# Exact values too commonly guessed to accept even if they clear the length bar.
+_WEAK_PASSWORDS = frozenset({
+    "secret", "password", "admin", "letmein", "welcome",
+    "123456", "12345678", "qwerty", "changeme", "default",
+})
 
 
 def _parse_chunk_sizes(raw: str) -> list[int]:
@@ -175,11 +189,23 @@ class Settings:
     # Generate one with:  python -c "import secrets; print(secrets.token_hex(32))"
     JWT_SECRET: str = os.getenv("JWT_SECRET", DEFAULT_JWT_SECRET)
 
-    # Escape hatch for local development and CI, where the placeholder secret
-    # is harmless. Anything that serves real users must set a real JWT_SECRET
-    # rather than setting this.
-    ALLOW_INSECURE_JWT_SECRET: bool = (
-        os.getenv("ALLOW_INSECURE_JWT_SECRET", "false").lower() == "true"
+    # Shared password for the demo accounts in auth/jwt_handler.py. Must be set
+    # to something real for any deployment that is reachable, or `admin` can
+    # simply be logged into.
+    DEMO_USER_PASSWORD: str = os.getenv(
+        "DEMO_USER_PASSWORD", DEFAULT_DEMO_USER_PASSWORD
+    )
+
+    # Escape hatch for local development and CI, where placeholder credentials
+    # are harmless. Covers the signing key and the demo password together —
+    # they answer the same question ("is this a real environment?"), so they
+    # share one switch. ALLOW_INSECURE_JWT_SECRET is honoured as a deprecated
+    # alias so existing environments keep working.
+    ALLOW_INSECURE_AUTH: bool = (
+        os.getenv(
+            "ALLOW_INSECURE_AUTH",
+            os.getenv("ALLOW_INSECURE_JWT_SECRET", "false"),
+        ).lower() == "true"
     )
     JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
     JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))  # 8 hours
@@ -273,29 +299,47 @@ def _validate_security_settings(s: Settings) -> None:
     nothing in the logs would indicate it. Failing at startup turns a silent
     compromise into an obvious, immediate error.
     """
+    problems: list[str] = []
+
     reason = _jwt_secret_problem(s.JWT_SECRET)
-    if reason is None:
+    if reason:
+        problems.append(
+            f"JWT_SECRET: {reason}.\n"
+            "    Tokens are signed with this key, so a guessable value lets "
+            "anyone forge a token for any role, including admin.\n"
+            '    Generate one:  python -c "import secrets; '
+            'print(secrets.token_hex(32))"'
+        )
+
+    reason = _demo_password_problem(s.DEMO_USER_PASSWORD)
+    if reason:
+        problems.append(
+            f"DEMO_USER_PASSWORD: {reason}.\n"
+            "    Every demo account shares this password, including admin, so "
+            "a reachable deployment can simply be logged into.\n"
+            '    Generate one:  python -c "import secrets; '
+            'print(secrets.token_urlsafe(24))"'
+        )
+
+    if not problems:
         return
 
-    if s.ALLOW_INSECURE_JWT_SECRET:
+    listed = "\n\n".join(f"  - {p}" for p in problems)
+
+    if s.ALLOW_INSECURE_AUTH:
         logger.warning(
-            f"JWT_SECRET is not usable in production ({reason}). Allowed "
-            f"because ALLOW_INSECURE_JWT_SECRET=true — never set that outside "
-            f"local development or CI."
+            "Insecure auth settings accepted because ALLOW_INSECURE_AUTH=true "
+            "— never set that outside local development or CI:\n" + listed
         )
         return
 
     raise ValueError(
-        f"JWT_SECRET is not safe to run with: {reason}.\n\n"
-        "Tokens are signed with this key, so a guessable value lets anyone "
-        "forge a token for any role — including admin, which bypasses RBAC "
-        "entirely.\n\n"
-        "Generate one:\n"
-        '    python -c "import secrets; print(secrets.token_hex(32))"\n\n'
-        "then set JWT_SECRET in your environment (in the ECS task definition "
-        "for the deployed service, ideally via secrets rather than plaintext).\n\n"
+        "Refusing to start with insecure auth settings:\n\n"
+        + listed
+        + "\n\nSet these in your environment (in the ECS task definition for "
+        "the deployed service, ideally via secrets rather than plaintext).\n"
         "For local development or CI, where this does not matter, set "
-        "ALLOW_INSECURE_JWT_SECRET=true instead."
+        "ALLOW_INSECURE_AUTH=true instead."
     )
 
 
@@ -312,15 +356,49 @@ def _jwt_secret_problem(secret: str) -> str | None:
     if secret == DEFAULT_JWT_SECRET:
         return "it is the placeholder committed to this repository"
 
-    lowered = secret.lower()
-    for marker in _JWT_SECRET_PLACEHOLDER_MARKERS:
-        if marker in lowered:
-            return f"it looks like an unfilled template value (contains {marker!r})"
+    marker = _placeholder_marker_in(secret)
+    if marker:
+        return f"it looks like an unfilled template value (contains {marker!r})"
 
     if len(secret) < MIN_JWT_SECRET_LENGTH:
         return (
             f"it is only {len(secret)} characters; "
             f"at least {MIN_JWT_SECRET_LENGTH} are required"
+        )
+
+    return None
+
+
+def _placeholder_marker_in(value: str) -> str | None:
+    """Return the template marker found in `value`, if any."""
+    lowered = value.lower()
+    for marker in _PLACEHOLDER_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+def _demo_password_problem(password: str) -> str | None:
+    """
+    Describe why `password` is unusable for the demo accounts, or None.
+
+    Same shape as _jwt_secret_problem, with a lower length bar: this is a
+    password a person types, not a signing key.
+    """
+    if not password:
+        return "it is empty"
+
+    if password.lower() in _WEAK_PASSWORDS:
+        return f"{password!r} is among the most commonly guessed passwords"
+
+    marker = _placeholder_marker_in(password)
+    if marker:
+        return f"it looks like an unfilled template value (contains {marker!r})"
+
+    if len(password) < MIN_DEMO_PASSWORD_LENGTH:
+        return (
+            f"it is only {len(password)} characters; "
+            f"at least {MIN_DEMO_PASSWORD_LENGTH} are required"
         )
 
     return None

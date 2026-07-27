@@ -151,7 +151,7 @@ uvicorn api.main:app --reload
 streamlit run ui/app.py
 ```
 
-The demo users are defined in `auth/jwt_handler.py`, each with a different role, all with the password `secret`. Logging in as different users shows RBAC in action: an HR user can see the leave policy, a general employee cannot.
+The demo users are defined in `auth/jwt_handler.py`, each with a different role, all sharing the password set in `DEMO_USER_PASSWORD`. It defaults to `secret` for local use, and the app refuses to start with that default unless `ALLOW_INSECURE_AUTH=true` — otherwise a reachable deployment could simply be logged into as `admin`. Logging in as different users shows RBAC in action: an HR user can see the leave policy, a general employee cannot.
 
 ## Ingestion
 
@@ -253,7 +253,7 @@ curl -X POST http://localhost:8000/query \
 
 `GET /health` — liveness/readiness check (no auth), used as the container health check.
 
-Get a token from `POST /token` (or `/auth/token`) with a demo username and the password `secret`.
+Get a token from `POST /token` (or `/auth/token`) with a demo username and the password from `DEMO_USER_PASSWORD` (`secret` by default locally).
 
 ## Configuration
 

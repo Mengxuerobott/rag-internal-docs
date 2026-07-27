@@ -42,9 +42,10 @@ jobs:
           # the query engine and the intent classifier are mocked, and no test
           # reaches the network.
           OPENAI_API_KEY: sk-dummy-value-tests-mock-all-network-calls
-          # Startup refuses the placeholder JWT_SECRET unless told the context
-          # is safe. It is safe here: nothing this job serves is reachable.
-          ALLOW_INSECURE_JWT_SECRET: "true"
+          # Startup refuses placeholder auth credentials unless told the
+          # context is safe. It is safe here: nothing this job serves is
+          # reachable.
+          ALLOW_INSECURE_AUTH: "true"
         run: pytest tests/ -v
 
   deploy:

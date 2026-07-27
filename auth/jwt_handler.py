@@ -46,17 +46,26 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 # ── Demo user store ────────────────────────────────────────────────────────────
 # In production: replace with DB lookup (users table) or IdP token introspection.
-# Passwords are bcrypt-hashed. Plain-text equivalents are in .env.example comments.
 #
+# The shared password comes from DEMO_USER_PASSWORD rather than being hardcoded.
+# It used to be the literal "secret", which meant anyone who read this file
+# could sign in as `admin` on a reachable deployment — a strong JWT_SECRET stops
+# forged tokens but not a legitimate login. config.py refuses to start when this
+# is left at its default outside local development.
+#
+# Hashed once and shared: bcrypt is deliberately slow, and hashing the same
+# password seven times cost ~0.5s on every import for no benefit.
+_DEMO_PASSWORD_HASH = hash_password(settings.DEMO_USER_PASSWORD)
+
 # username → {hashed_password, role, full_name}
 _DEMO_USERS: dict[str, dict] = {
-    "alice":   {"password": hash_password("secret"), "role": "hr",          "full_name": "Alice Chen"},
-    "bob":     {"password": hash_password("secret"), "role": "engineering",  "full_name": "Bob Kumar"},
-    "carol":   {"password": hash_password("secret"), "role": "finance",      "full_name": "Carol Smith"},
-    "dave":    {"password": hash_password("secret"), "role": "management",   "full_name": "Dave Park"},
-    "eve":     {"password": hash_password("secret"), "role": "employee",     "full_name": "Eve Torres"},
-    "frank":   {"password": hash_password("secret"), "role": "legal",        "full_name": "Frank Liu"},
-    "admin":   {"password": hash_password("secret"), "role": "admin",        "full_name": "System Admin"},
+    "alice":   {"password": _DEMO_PASSWORD_HASH, "role": "hr",           "full_name": "Alice Chen"},
+    "bob":     {"password": _DEMO_PASSWORD_HASH, "role": "engineering",  "full_name": "Bob Kumar"},
+    "carol":   {"password": _DEMO_PASSWORD_HASH, "role": "finance",      "full_name": "Carol Smith"},
+    "dave":    {"password": _DEMO_PASSWORD_HASH, "role": "management",   "full_name": "Dave Park"},
+    "eve":     {"password": _DEMO_PASSWORD_HASH, "role": "employee",     "full_name": "Eve Torres"},
+    "frank":   {"password": _DEMO_PASSWORD_HASH, "role": "legal",        "full_name": "Frank Liu"},
+    "admin":   {"password": _DEMO_PASSWORD_HASH, "role": "admin",        "full_name": "System Admin"},
 }
 
 
