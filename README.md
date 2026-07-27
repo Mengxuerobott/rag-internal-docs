@@ -189,6 +189,8 @@ Test case format:
 
 Every query is traced end to end with [Langfuse](https://langfuse.com/), so each step's input, output, latency, and token usage is visible rather than just the final answer and a total elapsed time.
 
+> **Status: enabled locally, disabled in the deployed service.** There is a known incompatibility between the Langfuse callback bridge and a hybrid-enabled Qdrant store — see [Known issue](#known-issue-tracing-with-hybrid-qdrant) below. Tracing is off (`LANGFUSE_ENABLED=false`) on Fargate; everything described here works against a local Qdrant.
+
 Sign up at [cloud.langfuse.com](https://cloud.langfuse.com), create a project, and copy the keys from Settings → API Keys into `.env`:
 
 ```
@@ -220,6 +222,32 @@ The `retrieve` / `node_postprocessing` / `synthesize` spans come for free. Langf
 Steps that bypass LlamaIndex are traced explicitly with the `@traced` decorator in `observability.py`: intent classification and small talk (both raw `openai` SDK calls) and the summarization handler's Qdrant scroll. RBAC gets no span of its own since it builds a filter object and does no I/O; the expanded role list is recorded on the root trace instead, so "what was this user allowed to see?" is answerable straight from the trace.
 
 `python -m eval.ragas_eval` runs each test case in its own trace and attaches its faithfulness, answer relevancy, context precision, and context recall scores to it. A weak score then becomes clickable: open the trace and see whether the reranker dropped the chunk that mattered or the synthesizer ignored it.
+
+### Known issue: tracing with hybrid Qdrant
+
+With `LANGFUSE_ENABLED=true` against a Qdrant store created with `enable_hybrid=True`, queries fail with:
+
+```
+'OpenAIEmbedding' object has no attribute 'callback_manager'
+```
+
+immediately preceded by:
+
+```
+Removing unpickleable private attribute _client
+Removing unpickleable private attribute _sparse_doc_fn
+Removing unpickleable private attribute _sparse_query_fn
+```
+
+Those three attributes belong to `QdrantVectorStore`, and the warning comes from LlamaIndex's `BaseComponent.__getstate__`. Its matching `__setstate__` rebuilds the object with `self.__init__(**state["__dict__"])`, which drops fields that were stripped as unpickleable — so an embedding model comes back out of that round trip without its `callback_manager`. Something in the Langfuse callback bridge is serializing an object graph that reaches the vector store; Langfuse's JSON encoder recursively walks `vars(obj)` for objects it doesn't recognise, which is the most likely trigger.
+
+It reproduces only with the full deployed combination. Local attempts with `SimpleVectorStore`, with in-memory Qdrant in hybrid mode, on Python 3.11 and 3.12, and through the real query-engine builder all complete normally — the difference appears to need a remote Qdrant with the reranker in the chain.
+
+Because tracing is behind a flag that compiles the decorators away when off, the fix was to disable it in the deployed service rather than block on a third-party integration bug. The instrumentation code is unchanged and works against a local Qdrant.
+
+Fixing it properly means one of: identifying the offending event type and excluding it via the handler's `event_starts_to_ignore`; upgrading to `llama-index-core` ≥ 0.11 with `langfuse` 3.x, whose integration uses the newer instrumentation API instead of callbacks; or switching to an OpenTelemetry-based instrumentation such as OpenInference, which does not serialize payloads this way.
+
+### LangSmith
 
 One leftover worth knowing: `requirements.txt` still pins `langsmith` and `config.py` still carries `LANGCHAIN_*` settings, but neither is active. LangSmith's automatic tracing instruments LangChain runnables, and this project is LlamaIndex-only, so `LANGCHAIN_TRACING_V2` never captured anything here. The package stays because `ragas` depends on it transitively.
 
