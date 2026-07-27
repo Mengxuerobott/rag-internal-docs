@@ -193,7 +193,7 @@ class TestSmallTalkHandler:
             choices=[MagicMock(message=MagicMock(content="Hi! How can I help you today?"))]
         )
 
-        with patch("retrieval.handlers._get_openai_client", return_value=mock_client):
+        with patch("retrieval.handlers._openai", return_value=mock_client):
             # SmallTalkHandler uses OpenAI() directly
             with patch("retrieval.handlers.OpenAI", return_value=mock_client):
                 result = SmallTalkHandler().handle(ctx)

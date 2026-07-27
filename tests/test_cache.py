@@ -47,6 +47,7 @@ from cache.semantic_cache import (
     init_semantic_cache,
 )
 from retrieval.handlers import ConversationTurn, RouteResult
+from retrieval.router import Intent
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -398,8 +399,14 @@ class TestCacheSet:
              patch("config.settings.SEMANTIC_CACHE_MAX_ENTRIES", 10000):
             cache.set("new question", "answer", [], "deep_rag", "employee")
 
-        # delete should have been called for the old entry
-        redis.delete.assert_called()
+        # Eviction is issued through a pipeline, not on the client directly,
+        # so assert against the pipeline mock. For each evicted id the code
+        # deletes the entry key and the vector key, then drops it from the
+        # sorted-set index.
+        assert pipe.delete.call_count >= 2, (
+            "expected the entry and vector keys of the evicted id to be deleted"
+        )
+        pipe.zrem.assert_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -523,7 +530,7 @@ class TestRouterCacheIntegration:
 
         with patch("retrieval.router.get_semantic_cache", return_value=mock_cache), \
              patch("retrieval.router.classify_intent",
-                   return_value=("deep_rag", 0.95, None)) as mock_classify, \
+                   return_value=(Intent.DEEP_RAG, 0.95, None)) as mock_classify, \
              patch("retrieval.router.DeepRagHandler") as MockDR:
 
             mock_dr_result = MagicMock()
@@ -549,7 +556,7 @@ class TestRouterCacheIntegration:
 
         with patch("retrieval.router.get_semantic_cache", return_value=mock_cache), \
              patch("retrieval.router.classify_intent",
-                   return_value=("deep_rag", 0.95, None)), \
+                   return_value=(Intent.DEEP_RAG, 0.95, None)), \
              patch("retrieval.router.DeepRagHandler") as MockDR:
 
             mock_result = MagicMock()
@@ -573,7 +580,7 @@ class TestRouterCacheIntegration:
 
         with patch("retrieval.router.get_semantic_cache", return_value=mock_cache), \
              patch("retrieval.router.classify_intent",
-                   return_value=("small_talk", 0.95, None)), \
+                   return_value=(Intent.SMALL_TALK, 0.95, None)), \
              patch("retrieval.router.SmallTalkHandler") as MockST:
 
             mock_result = MagicMock()
@@ -595,7 +602,7 @@ class TestRouterCacheIntegration:
 
         with patch("retrieval.router.get_semantic_cache", return_value=mock_cache), \
              patch("retrieval.router.classify_intent",
-                   return_value=("deep_rag", 0.95, None)), \
+                   return_value=(Intent.DEEP_RAG, 0.95, None)), \
              patch("retrieval.router.DeepRagHandler") as MockDR:
 
             mock_result = MagicMock()
@@ -722,7 +729,7 @@ class TestGracefulDegradation:
 
         with patch("retrieval.router.get_semantic_cache", return_value=None), \
              patch("retrieval.router.classify_intent",
-                   return_value=("small_talk", 0.95, None)), \
+                   return_value=(Intent.SMALL_TALK, 0.95, None)), \
              patch("retrieval.router.SmallTalkHandler") as MockST:
 
             mock_result = MagicMock()
