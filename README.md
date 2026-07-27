@@ -19,6 +19,7 @@ At query time, the request is authenticated (JWT) and routed by intent. A knowle
 - Reranker: Cohere Rerank v3 (cross-encoder)
 - LLM: OpenAI (configurable in `.env`)
 - Evaluation: RAGAS
+- Observability: Langfuse — per-step tracing of every query (inputs, outputs, latency, tokens)
 - API: FastAPI with streaming (SSE) responses
 - UI: Streamlit
 - Auth: JWT with role-based access control
@@ -182,6 +183,44 @@ Test case format:
 ]
 ```
 
+## Observability
+
+Every query is traced end to end with [Langfuse](https://langfuse.com/), so each step's input, output, latency, and token usage is visible rather than just the final answer and a total elapsed time.
+
+Sign up at [cloud.langfuse.com](https://cloud.langfuse.com), create a project, and copy the keys from Settings → API Keys into `.env`:
+
+```
+LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com
+```
+
+Tracing is off unless `LANGFUSE_ENABLED` is true *and* both keys are set. With it off the request path is unchanged and the decorators compile away, so there is no call-time cost. Failures are swallowed throughout: a bad key or an unreachable host costs traces, never requests.
+
+Each request produces one root trace with the pipeline nested underneath:
+
+```
+route_query                    user, role, accessible_roles, dept filter,
+│                              route_type, cache_hit, total_ms
+├── classify_intent            intent, confidence, target_doc, tokens
+└── deep_rag_handler
+    ├── retrieve               hybrid dense + SPLADE sparse, RRF-fused in
+    │                          Qdrant behind the RBAC pre-filter
+    ├── (AutoMerging)          leaf → parent chunk swaps
+    ├── node_postprocessing    Cohere rerank: node scores before and after,
+    │                          and which chunks were dropped
+    └── synthesize → llm       final prompt, completion, token usage
+```
+
+The `retrieve` / `node_postprocessing` / `synthesize` spans come for free. Langfuse attaches to LlamaIndex's `CallbackManager` via `set_global_handler("langfuse")`, instrumenting the library rather than our call sites — which is also why both query-engine assembly paths are covered without duplicated instrumentation.
+
+Steps that bypass LlamaIndex are traced explicitly with the `@traced` decorator in `observability.py`: intent classification and small talk (both raw `openai` SDK calls) and the summarization handler's Qdrant scroll. RBAC gets no span of its own since it builds a filter object and does no I/O; the expanded role list is recorded on the root trace instead, so "what was this user allowed to see?" is answerable straight from the trace.
+
+`python -m eval.ragas_eval` runs each test case in its own trace and attaches its faithfulness, answer relevancy, context precision, and context recall scores to it. A weak score then becomes clickable: open the trace and see whether the reranker dropped the chunk that mattered or the synthesizer ignored it.
+
+One leftover worth knowing: `requirements.txt` still pins `langsmith` and `config.py` still carries `LANGCHAIN_*` settings, but neither is active. LangSmith's automatic tracing instruments LangChain runnables, and this project is LlamaIndex-only, so `LANGCHAIN_TRACING_V2` never captured anything here. The package stays because `ragas` depends on it transitively.
+
 ## Tests
 
 ```
@@ -223,6 +262,10 @@ Everything is set in `.env`. The main options:
 | `HYBRID_ALPHA` | `0.5` | BM25 vs vector blend (0 = BM25, 1 = vector) |
 | `CHUNK_SIZES` | `2048,512,128` | hierarchical chunk sizes in tokens |
 | `SEMANTIC_CACHE_ENABLED` | `true` | Redis semantic cache; set to `false` if you are not running Redis |
+| `LANGFUSE_ENABLED` | `false` | master switch for query tracing; needs both keys below to take effect |
+| `LANGFUSE_PUBLIC_KEY` | — | Langfuse project public key (`pk-lf-...`) |
+| `LANGFUSE_SECRET_KEY` | — | Langfuse project secret key (`sk-lf-...`) |
+| `LANGFUSE_HOST` | `https://cloud.langfuse.com` | EU cloud by default; use the US URL or your self-hosted address |
 
 ## Known limitations
 
