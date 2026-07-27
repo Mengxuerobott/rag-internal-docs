@@ -11,3 +11,6 @@ pytest==8.3.3
 # Required by the async webhook tests, which use @pytest.mark.asyncio.
 # Without it those marks are silently ignored and the tests do not run.
 pytest-asyncio==0.24.0
+# The README documents `pytest tests/ --cov=. --cov-report=html`, which fails
+# without this on a fresh install.
+pytest-cov==5.0.0
