@@ -6,7 +6,9 @@ All values come from environment variables (set via .env or docker-compose).
 
 import os
 from functools import lru_cache
+
 from dotenv import load_dotenv
+from loguru import logger
 
 load_dotenv()
 
@@ -18,6 +20,33 @@ load_dotenv()
 # 80 the parser raises "Metadata length is longer than chunk size" partway
 # through ingestion, which is a confusing place to discover a config typo.
 MIN_LEAF_CHUNK_SIZE = 128
+
+# The placeholder JWT signing key shipped in .env.example. It is committed to a
+# public repository, so anything running with it will accept tokens forged by
+# anyone who has read the repo — including tokens claiming the "admin" role,
+# which bypasses RBAC entirely. Startup refuses it unless explicitly allowed.
+DEFAULT_JWT_SECRET = "change-me-in-production-use-secrets-token-hex-32"
+
+# A signing key shorter than this is brute-forceable. `secrets.token_hex(32)`,
+# the command this project documents, produces 64 characters.
+MIN_JWT_SECRET_LENGTH = 32
+
+# Substrings that mark a value as an unfilled template rather than a real
+# secret. Checking only for DEFAULT_JWT_SECRET was not enough: the deployed
+# task definition carried "REPLACE_JWT_SECRET", which is not the .env.example
+# default and so passed silently while being trivially guessable. Placeholders
+# come from many templates, so match the shape, not one literal.
+_JWT_SECRET_PLACEHOLDER_MARKERS = (
+    "replace",
+    "change-me",
+    "changeme",
+    "placeholder",
+    "your-secret",
+    "your_secret",
+    "example",
+    "todo",
+    "xxx",
+)
 
 
 def _parse_chunk_sizes(raw: str) -> list[int]:
@@ -144,7 +173,14 @@ class Settings:
     # ── Auth / JWT ────────────────────────────────────────────────────────────
     # IMPORTANT: set a strong random secret in production.
     # Generate one with:  python -c "import secrets; print(secrets.token_hex(32))"
-    JWT_SECRET: str = os.getenv("JWT_SECRET", "change-me-in-production-use-secrets-token-hex-32")
+    JWT_SECRET: str = os.getenv("JWT_SECRET", DEFAULT_JWT_SECRET)
+
+    # Escape hatch for local development and CI, where the placeholder secret
+    # is harmless. Anything that serves real users must set a real JWT_SECRET
+    # rather than setting this.
+    ALLOW_INSECURE_JWT_SECRET: bool = (
+        os.getenv("ALLOW_INSECURE_JWT_SECRET", "false").lower() == "true"
+    )
     JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
     JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))  # 8 hours
 
@@ -227,10 +263,75 @@ class Settings:
     INDEX_PERSIST_DIR: str = os.getenv("INDEX_PERSIST_DIR", "data/index_store")
 
 
+def _validate_security_settings(s: Settings) -> None:
+    """
+    Refuse to start with a signing key that cannot be trusted.
+
+    Without this the fallback is silent: the app boots normally and serves
+    traffic while accepting tokens anyone can mint from the placeholder secret
+    in the public repo. A forged "admin" token bypasses RBAC completely, and
+    nothing in the logs would indicate it. Failing at startup turns a silent
+    compromise into an obvious, immediate error.
+    """
+    reason = _jwt_secret_problem(s.JWT_SECRET)
+    if reason is None:
+        return
+
+    if s.ALLOW_INSECURE_JWT_SECRET:
+        logger.warning(
+            f"JWT_SECRET is not usable in production ({reason}). Allowed "
+            f"because ALLOW_INSECURE_JWT_SECRET=true — never set that outside "
+            f"local development or CI."
+        )
+        return
+
+    raise ValueError(
+        f"JWT_SECRET is not safe to run with: {reason}.\n\n"
+        "Tokens are signed with this key, so a guessable value lets anyone "
+        "forge a token for any role — including admin, which bypasses RBAC "
+        "entirely.\n\n"
+        "Generate one:\n"
+        '    python -c "import secrets; print(secrets.token_hex(32))"\n\n'
+        "then set JWT_SECRET in your environment (in the ECS task definition "
+        "for the deployed service, ideally via secrets rather than plaintext).\n\n"
+        "For local development or CI, where this does not matter, set "
+        "ALLOW_INSECURE_JWT_SECRET=true instead."
+    )
+
+
+def _jwt_secret_problem(secret: str) -> str | None:
+    """
+    Describe why `secret` is unusable as a signing key, or None if it is fine.
+
+    Returns a human-readable reason so the startup error can say what is
+    actually wrong rather than just refusing.
+    """
+    if not secret:
+        return "it is empty"
+
+    if secret == DEFAULT_JWT_SECRET:
+        return "it is the placeholder committed to this repository"
+
+    lowered = secret.lower()
+    for marker in _JWT_SECRET_PLACEHOLDER_MARKERS:
+        if marker in lowered:
+            return f"it looks like an unfilled template value (contains {marker!r})"
+
+    if len(secret) < MIN_JWT_SECRET_LENGTH:
+        return (
+            f"it is only {len(secret)} characters; "
+            f"at least {MIN_JWT_SECRET_LENGTH} are required"
+        )
+
+    return None
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return a cached singleton Settings instance."""
-    return Settings()
+    s = Settings()
+    _validate_security_settings(s)
+    return s
 
 
 settings = get_settings()

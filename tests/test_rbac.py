@@ -319,3 +319,74 @@ class TestRbacFilterConstruction:
 
     def test_empty_department_string_adds_no_clause(self):
         assert len(self._f("hr", "").filters) == 1
+
+
+# ── JWT signing key validation ────────────────────────────────────────────────
+class TestJwtSecretValidation:
+    """
+    The placeholder JWT_SECRET is committed to a public repo, so running with
+    it means anyone can forge a token for any role — including admin, which
+    bypasses every RBAC check above. Startup refuses it rather than failing
+    silently.
+    """
+
+    def _check(self, secret, allow_insecure):
+        import config
+        s = MagicMock()
+        s.JWT_SECRET = secret
+        s.ALLOW_INSECURE_JWT_SECRET = allow_insecure
+        config._validate_security_settings(s)
+
+    def test_placeholder_secret_refused_by_default(self):
+        import config
+        with pytest.raises(ValueError, match="placeholder committed to this repository"):
+            self._check(config.DEFAULT_JWT_SECRET, allow_insecure=False)
+
+    def test_error_explains_how_to_generate_one(self):
+        import config
+        with pytest.raises(ValueError, match="token_hex"):
+            self._check(config.DEFAULT_JWT_SECRET, allow_insecure=False)
+
+    def test_placeholder_allowed_with_explicit_opt_in(self):
+        """Local dev and CI opt in; this must not raise."""
+        import config
+        self._check(config.DEFAULT_JWT_SECRET, allow_insecure=True)
+
+    def test_real_secret_accepted(self):
+        import secrets
+        self._check(secrets.token_hex(32), allow_insecure=False)
+
+    def test_real_secret_accepted_regardless_of_opt_in(self):
+        import secrets
+        self._check(secrets.token_hex(32), allow_insecure=True)
+
+    # ── Placeholders other than the .env.example default ──────────────────
+    # The first version of this guard only compared against
+    # DEFAULT_JWT_SECRET. The deployed task definition carried
+    # "REPLACE_JWT_SECRET", which is not that value, so it passed silently
+    # while being trivially guessable. These pin the broader check.
+
+    @pytest.mark.parametrize("secret", [
+        "REPLACE_JWT_SECRET",           # the value found in production
+        "replace-me",
+        "CHANGEME_SET_THIS",
+        "your-secret-key-goes-here-padded-to-length",
+        "placeholder-value-padded-out-to-thirty-two",
+        "TODO-set-a-real-signing-key-here-please-ok",
+    ])
+    def test_template_placeholders_refused(self, secret):
+        with pytest.raises(ValueError, match="template value"):
+            self._check(secret, allow_insecure=False)
+
+    def test_empty_secret_refused(self):
+        with pytest.raises(ValueError, match="empty"):
+            self._check("", allow_insecure=False)
+
+    def test_short_secret_refused(self):
+        """Long enough to dodge the placeholder markers, still brute-forceable."""
+        with pytest.raises(ValueError, match="characters"):
+            self._check("a1b2c3d4", allow_insecure=False)
+
+    def test_minimum_length_boundary(self):
+        from config import MIN_JWT_SECRET_LENGTH
+        self._check("a1b2" * (MIN_JWT_SECRET_LENGTH // 4), allow_insecure=False)
