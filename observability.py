@@ -155,6 +155,7 @@ def shutdown_tracing() -> None:
 def traced(
     name: Optional[str] = None,
     as_type: Optional[str] = None,
+    transform_to_string: Optional[Callable[[Any], str]] = None,
 ) -> Callable[[F], F]:
     """
     Wrap a function in a Langfuse span.
@@ -167,11 +168,27 @@ def traced(
     this returns the original function unchanged, so there is zero call-time
     overhead and zero behaviour change on the disabled path.
 
+    Generators are handled correctly. Langfuse inspects the *return value*,
+    and when it's a (sync or async) generator it re-wraps it so the span is
+    closed in a `finally` when the generator is exhausted — not when the
+    generator object is constructed. That's what makes this safe to put on the
+    SSE streaming path, where the span must stay open for the whole stream.
+
+    One caveat worth knowing: the wrapper is a plain function, so
+    `inspect.isasyncgenfunction()` reports False on a decorated async
+    generator. Consuming it with `async for` is unaffected, but don't rely on
+    that introspection downstream.
+
     Args:
-        name:    Span name shown in the Langfuse UI. Defaults to __name__.
-        as_type: Pass "generation" for spans that wrap an LLM call, so Langfuse
-                 renders them with model/token/cost detail instead of as a
-                 plain span.
+        name:     Span name shown in the Langfuse UI. Defaults to __name__.
+        as_type:  Pass "generation" for spans that wrap an LLM call, so
+                  Langfuse renders model/token/cost detail instead of a plain
+                  span.
+        transform_to_string:
+                  For generators: builds the span's recorded output from the
+                  list of yielded items. Without it Langfuse concatenates
+                  every yielded string, which on the SSE path would capture
+                  raw `data: ...\\n\\n` protocol framing rather than the answer.
 
     Usage:
         @traced(name="classify_intent", as_type="generation")
@@ -185,7 +202,11 @@ def traced(
         try:
             from langfuse.decorators import observe
 
-            return observe(name=name or fn.__name__, as_type=as_type)(fn)
+            return observe(
+                name=name or fn.__name__,
+                as_type=as_type,
+                transform_to_string=transform_to_string,
+            )(fn)
         except Exception as e:
             logger.warning(
                 f"Could not attach tracing to {fn.__qualname__} ({e}) — leaving it untraced."

@@ -74,8 +74,10 @@ from loguru import logger
 from openai import OpenAI
 
 from auth.jwt_handler import CurrentUser
+from auth.rbac import expand_roles
 from cache.semantic_cache import CacheEntry, SemanticCache, get_semantic_cache
 from config import settings
+from observability import traced, update_current_observation, update_current_trace
 from retrieval.handlers import (
     ConversationTurn,
     DeepRagHandler,
@@ -158,12 +160,16 @@ Classify the intent of CURRENT QUERY only."""
 
 # ── Intent classification ─────────────────────────────────────────────────────
 
+@traced(name="classify_intent", as_type="generation")
 def classify_intent(
     question: str,
     history: list[ConversationTurn],
 ) -> tuple[Intent, float, Optional[str]]:
     """
     Classify the intent of `question` using a single gpt-4o-mini call.
+
+    Traced manually: this goes through the raw openai SDK, so the LlamaIndex
+    global handler never sees it.
 
     Returns:
         (intent, confidence, target_doc)
@@ -204,6 +210,23 @@ def classify_intent(
 
         intent = Intent(intent_str)
 
+        # Record model, token usage and the classification result on the span
+        # so the routing decision is visible without re-reading logs.
+        usage = getattr(response, "usage", None)
+        update_current_observation(
+            model=settings.ROUTER_MODEL,
+            usage={
+                "input":  getattr(usage, "prompt_tokens", None),
+                "output": getattr(usage, "completion_tokens", None),
+                "total":  getattr(usage, "total_tokens", None),
+            } if usage else None,
+            intent=intent.value,
+            confidence=confidence,
+            target_doc=target_doc or None,
+            reasoning=reasoning,
+            history_turns=len(history),
+        )
+
         logger.debug(
             f"Intent classified: {intent.value!r} "
             f"(confidence={confidence:.2f}, target_doc={target_doc!r}) "
@@ -217,10 +240,24 @@ def classify_intent(
             f"Intent classifier returned malformed JSON ({e}) — "
             f"defaulting to DEEP_RAG"
         )
+        # Flag the fallback on the span — a silent default to DEEP_RAG is
+        # exactly the kind of thing that hides a broken classifier.
+        update_current_observation(
+            level="WARNING",
+            status_message=f"malformed classifier JSON: {e}",
+            intent=Intent.DEEP_RAG.value,
+            fallback=True,
+        )
         return Intent.DEEP_RAG, 0.5, None
 
     except Exception as e:
         logger.error(f"Intent classification failed ({e}) — defaulting to DEEP_RAG")
+        update_current_observation(
+            level="ERROR",
+            status_message=f"classifier call failed: {e}",
+            intent=Intent.DEEP_RAG.value,
+            fallback=True,
+        )
         return Intent.DEEP_RAG, 0.5, None
 
 
@@ -304,6 +341,7 @@ def _result_from_cache(entry: CacheEntry, question: str) -> RouteResult:
 
 # ── Main dispatch function ────────────────────────────────────────────────────
 
+@traced(name="route_query")
 def route_query(
     question:        str,
     user:            CurrentUser,
@@ -332,6 +370,20 @@ def route_query(
     """
     effective_session = session_id or user.username
 
+    # Request-level context on the root trace. RBAC gets no span of its own —
+    # it builds a filter object with no I/O — so the expanded role list is
+    # recorded here instead, making "what was this user allowed to see?"
+    # answerable straight from the trace.
+    update_current_trace(
+        user_id=user.username,
+        session_id=effective_session,
+        input=question,
+        user_role=user.role,
+        accessible_roles=expand_roles(user.role),
+        department_filter=department_filter,
+        streaming=False,
+    )
+
     # ── Step 1: Semantic cache check ──────────────────────────────────────────
     # This runs BEFORE intent classification, saving ~150ms on a cache hit.
     cache: Optional[SemanticCache] = get_semantic_cache()
@@ -343,6 +395,13 @@ def route_query(
                 session_id=effective_session,
                 user_message=question,
                 assistant_message=result.answer[:500],
+            )
+            update_current_trace(
+                output=result.answer,
+                route_type="cache_hit",
+                cache_hit=True,
+                cache_similarity=cached_entry.similarity,
+                tags=["cache_hit"],
             )
             logger.info(
                 f"Cache HIT returned — ns={user.role}:{department_filter or ''!r} "
@@ -409,6 +468,18 @@ def route_query(
 
     result.latency_ms = round(result.latency_ms + classify_ms, 1)
 
+    update_current_trace(
+        output=result.answer,
+        route_type=result.route_type,
+        cache_hit=False,
+        intent=intent.value,
+        confidence=confidence,
+        classify_ms=round(classify_ms, 1),
+        total_ms=result.latency_ms,
+        n_sources=len(result.sources),
+        tags=[result.route_type],
+    )
+
     logger.info(
         f"Router complete: route={result.route_type!r} "
         f"total_ms={result.latency_ms:.0f} "
@@ -420,6 +491,27 @@ def route_query(
 
 # ── Streaming variant ─────────────────────────────────────────────────────────
 
+def _sse_answer_only(items: list) -> str:
+    """
+    Rebuild the assistant's answer from the raw SSE frames a stream yielded.
+
+    Without this, Langfuse would record the span's output as every yielded
+    string concatenated — i.e. the wire format, control events and all
+    (`data: [ROUTE]deep_rag`, `data: [DONE]`). We want the answer text.
+    """
+    answer = []
+    for item in items:
+        if not isinstance(item, str) or not item.startswith("data: "):
+            continue
+        payload = item[len("data: "):].rstrip("\n")
+        # Skip control frames: [ROUTE], [CACHE], [SOURCES], [DONE]
+        if payload.startswith("[") and "]" in payload[:12]:
+            continue
+        answer.append(payload)
+    return "".join(answer)
+
+
+@traced(name="route_query_stream", transform_to_string=_sse_answer_only)
 async def route_query_stream(
     question:          str,
     user:              CurrentUser,
@@ -448,11 +540,30 @@ async def route_query_stream(
     import json as _json
     effective_session = session_id or user.username
 
+    # Same request-level context as the non-streaming path. The span this
+    # attaches to stays open until the generator is exhausted, so it covers
+    # the whole stream rather than just its construction.
+    update_current_trace(
+        user_id=user.username,
+        session_id=effective_session,
+        input=question,
+        user_role=user.role,
+        accessible_roles=expand_roles(user.role),
+        department_filter=department_filter,
+        streaming=True,
+    )
+
     # ── Cache check ───────────────────────────────────────────────────────────
     cache: Optional[SemanticCache] = get_semantic_cache()
     if cache:
         cached_entry = cache.get(question, user.role, department_filter)
         if cached_entry:
+            update_current_trace(
+                route_type="cache_hit",
+                cache_hit=True,
+                cache_similarity=cached_entry.similarity,
+                tags=["cache_hit", "streaming"],
+            )
             yield f"data: [ROUTE]cache_hit\n\n"
             # Send a cache metadata event so the UI can show the similarity score
             yield f"data: [CACHE]{cached_entry.similarity:.4f}\n\n"
@@ -562,6 +673,15 @@ async def route_query_stream(
             role=user.role,
             dept_filter=department_filter,
         )
+
+    update_current_trace(
+        route_type=intent.value,
+        cache_hit=False,
+        intent=intent.value,
+        n_sources=len(sources),
+        answer_chars=len(answer),
+        tags=[intent.value, "streaming"],
+    )
 
     yield f"data: [SOURCES]{_json.dumps({'sources': sources})}\n\n"
     yield "data: [DONE]\n\n"
