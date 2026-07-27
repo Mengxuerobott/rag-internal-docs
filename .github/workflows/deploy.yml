@@ -1,8 +1,9 @@
-name: Deploy to AWS Fargate
+name: Test and deploy to AWS Fargate
 
 on:
   push:
     branches: [main]
+  pull_request:        # run the tests on PRs, but never deploy from one
   workflow_dispatch:   # lets you trigger it manually from the Actions tab
 
 permissions:
@@ -16,7 +17,41 @@ env:
   ECS_SERVICE: rag-api-service
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 3.11, not 3.12: llama-index-postprocessor-cohere-rerank on the 0.1.x
+      # line — the line compatible with llama-index-core 0.10.x — requires
+      # Python < 3.12.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          # config.py reads OPENAI_API_KEY with os.environ[...] at import time,
+          # so it must be present or collection fails. The value is never used:
+          # the query engine and the intent classifier are mocked, and no test
+          # reaches the network.
+          OPENAI_API_KEY: sk-dummy-value-tests-mock-all-network-calls
+        run: pytest tests/ -v
+
   deploy:
+    # Gate the deploy on a green suite. Without this the tests are advisory
+    # and the suite drifts back to red, which is how it reached 42 collection
+    # errors before.
+    needs: test
+    # Pull requests run the tests above but must not deploy; this still allows
+    # push-to-main and manual workflow_dispatch runs.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

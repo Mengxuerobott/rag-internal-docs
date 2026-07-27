@@ -63,7 +63,9 @@ The API is packaged as a container and runs on Fargate. A few notes that matter 
 
 ### CI/CD
 
-Pushing to `main` triggers a GitHub Actions workflow (`.github/workflows/deploy.yml`) that builds the image for `linux/amd64`, pushes it to ECR (tagged both `latest` and the commit SHA), and triggers a new Fargate deployment.
+Pushing to `main` triggers a GitHub Actions workflow (`.github/workflows/deploy.yml`) that first runs the test suite, and only on a green run builds the image for `linux/amd64`, pushes it to ECR (tagged both `latest` and the commit SHA), and triggers a new Fargate deployment.
+
+Pull requests run the same test job but never deploy. The tests need no external services — the query engine and the intent classifier are mocked — so the job only sets a dummy `OPENAI_API_KEY`, which `config.py` requires at import time but nothing actually uses.
 
 Authentication to AWS uses OIDC rather than a stored access key: GitHub and AWS establish a trust relationship, and each workflow run assumes an IAM role to get short-lived credentials. The role's trust policy is scoped to this repository only, so no long-lived AWS credentials are stored in GitHub. Tagging each image with its commit SHA means every deployed image traces back to an exact commit.
 
