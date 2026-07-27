@@ -63,6 +63,7 @@ from retrieval.query_engine import (
 )
 from retrieval.router import route_query, route_query_stream, get_memory
 from cache.semantic_cache import init_semantic_cache, get_semantic_cache
+from observability import init_tracing, shutdown_tracing
 from webhooks.router import router as webhook_router
 
 
@@ -71,6 +72,11 @@ from webhooks.router import router as webhook_router
 async def lifespan(app: FastAPI):
     logger.info("Starting RAG API — loading index...")
     start = time.perf_counter()
+
+    # Install tracing before the index is built so that startup-time LLM and
+    # embedding calls are captured too. No-op unless LANGFUSE_ENABLED=true.
+    init_tracing()
+
     try:
         index = get_or_build_index()
         set_index(index)
@@ -81,6 +87,9 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to load index: {e}")
         raise
     yield
+    # Langfuse batches spans on a background thread; flush so the tail of the
+    # run isn't lost on shutdown.
+    shutdown_tracing()
     logger.info("Shutting down RAG API")
 
 
