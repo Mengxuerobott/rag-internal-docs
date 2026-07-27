@@ -41,6 +41,9 @@ llama-index-callbacks-langfuse==0.1.6
 # transitively — removing it would break the eval dependency chain.
 langsmith==0.1.147
 
+# AWS (optional — only used when INDEX_S3_BUCKET is set, see ingestion/index_sync.py)
+boto3==1.35.76
+
 # Utilities
 python-dotenv==1.0.1
 loguru==0.7.2

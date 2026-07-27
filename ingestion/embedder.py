@@ -229,7 +229,22 @@ def upsert_document(
         batch_size=32,
     )
 
-    # Load existing docstore so parent nodes are merged correctly
+    # Load existing docstore so parent nodes are merged correctly.
+    #
+    # Restoring from S3 first matters more here than at startup: this is a
+    # read-modify-write. If a worker starts with an empty local directory it
+    # would load an empty docstore, add only this document's nodes, and persist
+    # that — silently dropping every other document's parent nodes and breaking
+    # AutoMerging for them. No-op unless INDEX_S3_BUCKET is set.
+    from ingestion.index_sync import (
+        download_index_store,
+        local_index_store_present,
+        s3_configured,
+    )
+
+    if not local_index_store_present() and s3_configured():
+        download_index_store()
+
     docstore: SimpleDocumentStore
     persist_path = settings.INDEX_PERSIST_DIR
     if os.path.exists(persist_path):
@@ -258,6 +273,10 @@ def upsert_document(
     # Persist updated docstore
     os.makedirs(persist_path, exist_ok=True)
     storage_context.persist(persist_dir=persist_path)
+
+    from ingestion.index_sync import upload_index_store
+
+    upload_index_store()
 
     logger.info(
         f"Upserted {len(leaf_nodes)} leaf nodes for doc_id={resolved_doc_id!r}"
@@ -329,6 +348,11 @@ def build_index(docs_dir: str | None = None) -> VectorStoreIndex:
     storage_context.persist(persist_dir=settings.INDEX_PERSIST_DIR)
     logger.info(f"Index persisted to '{settings.INDEX_PERSIST_DIR}'")
 
+    # Mirror to S3 so the next task can restore this instead of re-embedding.
+    from ingestion.index_sync import upload_index_store
+
+    upload_index_store()
+
     return index
 
 
@@ -351,7 +375,20 @@ def load_index() -> VectorStoreIndex:
 
 
 def get_or_build_index(docs_dir: str | None = None) -> VectorStoreIndex:
-    if os.path.exists(settings.INDEX_PERSIST_DIR) and os.listdir(settings.INDEX_PERSIST_DIR):
+    from ingestion.index_sync import (
+        download_index_store,
+        local_index_store_present,
+        s3_configured,
+    )
+
+    # On Fargate the persist directory is empty on every start because the task
+    # filesystem is ephemeral. Restoring it from S3 avoids re-embedding the
+    # whole corpus just to rebuild the docstore. No-op unless INDEX_S3_BUCKET
+    # is set, in which case this behaves exactly as it did before.
+    if not local_index_store_present() and s3_configured():
+        download_index_store()
+
+    if local_index_store_present():
         logger.info("Persisted index found — loading from disk")
         try:
             return load_index()

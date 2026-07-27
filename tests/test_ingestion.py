@@ -11,6 +11,7 @@ Run:
 import os
 import sys
 import tempfile
+from unittest.mock import MagicMock
 from pathlib import Path
 
 import pytest
@@ -227,3 +228,119 @@ class TestChunkSizesValidation:
         from config import _parse_chunk_sizes, MIN_LEAF_CHUNK_SIZE
         with pytest.raises(ValueError, match="below the minimum"):
             _parse_chunk_sizes(f"2048,512,{MIN_LEAF_CHUNK_SIZE - 1}")
+
+
+# ── Durable index storage ─────────────────────────────────────────────────────
+class TestIndexSync:
+    """
+    The docstore holds the parent nodes AutoMerging walks to; Qdrant holds only
+    the embedded leaves. On Fargate the persist directory dies with the task, so
+    without this the whole corpus is re-embedded on every deploy purely to
+    rebuild it.
+    """
+
+    def _patch_settings(self, monkeypatch, bucket="", prefix="index_store"):
+        from config import settings
+        monkeypatch.setattr(settings, "INDEX_S3_BUCKET", bucket)
+        monkeypatch.setattr(settings, "INDEX_S3_PREFIX", prefix)
+
+    # ── Disabled by default ───────────────────────────────────────────────
+    def test_noop_when_bucket_unset(self, monkeypatch):
+        from ingestion import index_sync
+        self._patch_settings(monkeypatch, bucket="")
+        assert index_sync.s3_configured() is False
+        assert index_sync.download_index_store() is False
+        assert index_sync.upload_index_store() is False
+
+    def test_no_s3_client_created_when_unset(self, monkeypatch):
+        """Must not touch boto3 at all on the default path."""
+        from ingestion import index_sync
+        self._patch_settings(monkeypatch, bucket="")
+        called = []
+        monkeypatch.setattr(index_sync, "_client", lambda: called.append(1))
+        index_sync.download_index_store()
+        index_sync.upload_index_store()
+        assert called == []
+
+    # ── Download ──────────────────────────────────────────────────────────
+    def test_download_restores_files_preserving_layout(self, monkeypatch, tmp_path):
+        from ingestion import index_sync
+        self._patch_settings(monkeypatch, bucket="my-bucket")
+
+        client = MagicMock()
+        client.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [
+                {"Key": "index_store/docstore.json"},
+                {"Key": "index_store/nested/graph_store.json"},
+                {"Key": "index_store/"},          # directory marker, must be skipped
+            ]}
+        ]
+        monkeypatch.setattr(index_sync, "_client", lambda: client)
+
+        assert index_sync.download_index_store(str(tmp_path)) is True
+
+        downloaded = [c.args[2] for c in client.download_file.call_args_list]
+        assert len(downloaded) == 2, "directory marker should have been skipped"
+        assert any(p.endswith("docstore.json") for p in downloaded)
+        assert any("nested" in p for p in downloaded)
+
+    def test_download_returns_false_when_bucket_empty(self, monkeypatch, tmp_path):
+        """An empty bucket means build-and-upload, not an error."""
+        from ingestion import index_sync
+        self._patch_settings(monkeypatch, bucket="my-bucket")
+        client = MagicMock()
+        client.get_paginator.return_value.paginate.return_value = [{}]
+        monkeypatch.setattr(index_sync, "_client", lambda: client)
+        assert index_sync.download_index_store(str(tmp_path)) is False
+
+    def test_download_failure_degrades_to_rebuild(self, monkeypatch, tmp_path):
+        """S3 being unreachable must not take the API down."""
+        from ingestion import index_sync
+        self._patch_settings(monkeypatch, bucket="my-bucket")
+        client = MagicMock()
+        client.get_paginator.side_effect = RuntimeError("network is down")
+        monkeypatch.setattr(index_sync, "_client", lambda: client)
+        assert index_sync.download_index_store(str(tmp_path)) is False
+
+    # ── Upload ────────────────────────────────────────────────────────────
+    def test_upload_mirrors_every_file(self, monkeypatch, tmp_path):
+        from ingestion import index_sync
+        self._patch_settings(monkeypatch, bucket="my-bucket")
+
+        (tmp_path / "docstore.json").write_text("{}", encoding="utf-8")
+        nested = tmp_path / "nested"
+        nested.mkdir()
+        (nested / "index_store.json").write_text("{}", encoding="utf-8")
+
+        client = MagicMock()
+        monkeypatch.setattr(index_sync, "_client", lambda: client)
+
+        assert index_sync.upload_index_store(str(tmp_path)) is True
+
+        keys = sorted(c.args[2] for c in client.upload_file.call_args_list)
+        assert keys == ["index_store/docstore.json", "index_store/nested/index_store.json"]
+
+    def test_upload_failure_is_swallowed(self, monkeypatch, tmp_path):
+        """The index is still valid in memory; only the next restart pays."""
+        from ingestion import index_sync
+        self._patch_settings(monkeypatch, bucket="my-bucket")
+        (tmp_path / "docstore.json").write_text("{}", encoding="utf-8")
+        client = MagicMock()
+        client.upload_file.side_effect = RuntimeError("access denied")
+        monkeypatch.setattr(index_sync, "_client", lambda: client)
+        assert index_sync.upload_index_store(str(tmp_path)) is False
+
+    def test_upload_missing_directory_is_not_an_error(self, monkeypatch, tmp_path):
+        from ingestion import index_sync
+        self._patch_settings(monkeypatch, bucket="my-bucket")
+        assert index_sync.upload_index_store(str(tmp_path / "nope")) is False
+
+    # ── Local presence check ──────────────────────────────────────────────
+    def test_local_present_false_for_empty_dir(self, tmp_path):
+        from ingestion.index_sync import local_index_store_present
+        assert local_index_store_present(str(tmp_path)) is False
+
+    def test_local_present_true_when_populated(self, tmp_path):
+        from ingestion.index_sync import local_index_store_present
+        (tmp_path / "docstore.json").write_text("{}", encoding="utf-8")
+        assert local_index_store_present(str(tmp_path)) is True
