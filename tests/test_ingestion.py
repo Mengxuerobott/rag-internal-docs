@@ -179,3 +179,51 @@ class TestChunker:
         assert len(nodes) > 0
         for node in nodes:
             assert node.text.strip()
+
+
+# ── CHUNK_SIZES validation ────────────────────────────────────────────────────
+class TestChunkSizesValidation:
+    """
+    CHUNK_SIZES is user-editable in .env and feeds the hierarchical parser.
+    A bad value used to surface as an opaque parser error partway through an
+    ingestion run; it is now rejected at import with an actionable message.
+    """
+
+    def test_default_parses(self):
+        from config import _parse_chunk_sizes
+        assert _parse_chunk_sizes("2048,512,128") == [2048, 512, 128]
+
+    def test_whitespace_tolerated(self):
+        from config import _parse_chunk_sizes
+        assert _parse_chunk_sizes(" 1024 , 256 ") == [1024, 256]
+
+    def test_non_integer_rejected(self):
+        from config import _parse_chunk_sizes
+        with pytest.raises(ValueError, match="comma-separated integers"):
+            _parse_chunk_sizes("2048,abc")
+
+    def test_single_value_rejected(self):
+        from config import _parse_chunk_sizes
+        with pytest.raises(ValueError, match="at least two values"):
+            _parse_chunk_sizes("2048")
+
+    def test_ascending_order_rejected(self):
+        from config import _parse_chunk_sizes
+        with pytest.raises(ValueError, match="strictly descending"):
+            _parse_chunk_sizes("128,512,2048")
+
+    def test_duplicate_sizes_rejected(self):
+        from config import _parse_chunk_sizes
+        with pytest.raises(ValueError, match="must not repeat"):
+            _parse_chunk_sizes("512,512,128")
+
+    def test_non_positive_rejected(self):
+        from config import _parse_chunk_sizes
+        with pytest.raises(ValueError, match="must all be positive"):
+            _parse_chunk_sizes("2048,-5")
+
+    def test_leaf_below_metadata_length_rejected(self):
+        """The failure this validation exists to prevent."""
+        from config import _parse_chunk_sizes, MIN_LEAF_CHUNK_SIZE
+        with pytest.raises(ValueError, match="below the minimum"):
+            _parse_chunk_sizes(f"2048,512,{MIN_LEAF_CHUNK_SIZE - 1}")

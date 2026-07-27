@@ -11,6 +11,65 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Smallest leaf chunk we allow. LlamaIndex refuses to build a node whose
+# metadata is longer than its chunk size, and this project stamps source,
+# department, allowed_roles and ingestion timestamp onto every node — around
+# 76 characters in practice. 128 leaves comfortable headroom; below roughly
+# 80 the parser raises "Metadata length is longer than chunk size" partway
+# through ingestion, which is a confusing place to discover a config typo.
+MIN_LEAF_CHUNK_SIZE = 128
+
+
+def _parse_chunk_sizes(raw: str) -> list[int]:
+    """
+    Parse and validate the CHUNK_SIZES setting.
+
+    Expects a comma-separated, strictly descending list of at least two
+    positive integers, e.g. "2048,512,128" → [2048, 512, 128], representing
+    parent → child → leaf sizes for the hierarchical node parser.
+
+    Raises ValueError with an actionable message rather than letting a bad
+    value fail deep inside ingestion.
+    """
+    try:
+        sizes = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError as e:
+        raise ValueError(
+            f"CHUNK_SIZES must be comma-separated integers (got {raw!r}): {e}"
+        ) from e
+
+    if len(sizes) < 2:
+        raise ValueError(
+            f"CHUNK_SIZES needs at least two values (parent and leaf), got {sizes!r}. "
+            f"The default is 2048,512,128."
+        )
+
+    if any(s <= 0 for s in sizes):
+        raise ValueError(f"CHUNK_SIZES values must all be positive, got {sizes!r}.")
+
+    if sizes != sorted(sizes, reverse=True):
+        raise ValueError(
+            f"CHUNK_SIZES must be strictly descending (parent → child → leaf), "
+            f"got {sizes!r}. The default is 2048,512,128."
+        )
+
+    if len(set(sizes)) != len(sizes):
+        raise ValueError(
+            f"CHUNK_SIZES must not repeat a size, got {sizes!r} — each level of "
+            f"the hierarchy needs to be smaller than the one above it."
+        )
+
+    if sizes[-1] < MIN_LEAF_CHUNK_SIZE:
+        raise ValueError(
+            f"CHUNK_SIZES leaf size {sizes[-1]} is below the minimum "
+            f"{MIN_LEAF_CHUNK_SIZE}. Node metadata (source, department, "
+            f"allowed_roles, timestamp) is longer than that, and the parser "
+            f"rejects a chunk smaller than its own metadata."
+        )
+
+    return sizes
+
+
 class Settings:
     # ── LLM / Embeddings ─────────────────────────────────────────────────────
     OPENAI_API_KEY: str = os.environ["OPENAI_API_KEY"]
@@ -61,9 +120,12 @@ class Settings:
 
     # ── Chunking ──────────────────────────────────────────────────────────────
     # Parsed as list of ints: "2048,512,128" → [2048, 512, 128]
-    CHUNK_SIZES: list[int] = [
-        int(x) for x in os.getenv("CHUNK_SIZES", "2048,512,128").split(",")
-    ]
+    # Validated at import so a bad value fails at startup with a clear message,
+    # rather than surfacing much later as an opaque parser error partway
+    # through an ingestion run.
+    CHUNK_SIZES: list[int] = _parse_chunk_sizes(
+        os.getenv("CHUNK_SIZES", "2048,512,128")
+    )
 
     # ── Multimodal processing ─────────────────────────────────────────────────
     # Set to "false" to skip table summarisation and image description entirely.
